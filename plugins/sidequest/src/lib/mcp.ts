@@ -116,6 +116,14 @@ const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 // revision, not the working tree" condition have to be right on the FIRST call; and update addFiles /
 // removeFiles with scopeRequest grant (GitHub #173). +911 and +395 bytes compacted, so whichever
 // merges second still preserves the 2.5KB reserve.
+// Raised from 24100 for update.addFiles/removeFiles and scopeRequest.grant (GitHub #173). The base
+// carried 75 bytes of slack over the 2.5KB reserve (21525 payload) and had been held there by deleting
+// other property descriptions rather than by raising the cap; these properties and the live-claim rules
+// their descriptions have to state cost 535 bytes, so the payload is 22060 and the ceiling has to be at
+// least 24560. 24600 would be the smallest round value that passes this change alone. 25400 is
+// deliberately higher because GitHub #144 raises the same constant for its own properties: a shared
+// ceiling lets the two land in either order without the second one re-measuring. Any further addition
+// measures its own payload instead of inheriting this.
 // Then raised from 25400 to 25600, measured with GitHub #144 and #173 merged together: review
 // follow-ups grew #144 from the estimated +911 to +980 bytes and #173 from +395 to +535, so the
 // combined payload is 23040 against the 21525 base and 25400 leaves only 2360 of the 2500-byte
@@ -330,7 +338,11 @@ const MCP_SCHEMA_PROPERTY_DESCRIPTIONS: Record<string, Record<string, string>> =
   },
   add: { complexity: 'Legacy score; why required.', verify: ATTESTATION_VERIFY_CONTRACT },
   claim: { force: 'Operator-only.' },
-  update: { verify: ATTESTATION_VERIFY_CONTRACT },
+  update: {
+    verify: ATTESTATION_VERIFY_CONTRACT,
+    addFiles: 'Appends, keeps rest. Refused with files. Applied before removeFiles.',
+    removeFiles: 'Drops only these, keeps rest. Refused with files, and for a path this ticket does not declare. An isolated live dispatch loses them at once; a shared-tree one keeps them until redispatch.',
+  },
   supersede_submission: { supersededBy: 'Repair ticket ref, not a commit.' },
   comments: {
     since: 'Comment id or ISO timestamp.',
@@ -363,6 +375,9 @@ const MCP_SCHEMA_PROPERTY_DESCRIPTIONS: Record<string, Record<string, string>> =
   },
   verdict: {
     outcome: 'Candidate, not reviewer prose.',
+  },
+  scopeRequest: {
+    grant: 'Grants every path this claim still has refused; pass no files. Refuses the claim holder’s own by.',
   },
 };
 
