@@ -49,6 +49,7 @@ interface Worktrees {
     upstreamFallback?: boolean;
     entries?: Array<{ action: string; reason: string }>;
     remainingCandidates?: number;
+    statusTimedOut?: number;
     retainedBranches?: Array<{ branch: string; path: string; reason: string }>;
     failures?: Array<{ path: string | null; message: string; suppressed?: boolean }>;
     salvaged?: Array<{ path: string; ref: string; recovery: string }>;
@@ -232,7 +233,53 @@ function sweepRule(order: readonly string[]): string {
   return `Cleanup classifies in this order: ${order.join(', ')}.`;
 }
 
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code === 'EPERM';
+  }
+}
+
+// A detached SessionEnd sweep and the next SessionStart sweep (a /clear fires both back to back)
+// would otherwise rename the same trees into quarantine and race each other's git worktree repair.
+// null means a live sweep holds the lock; the lock is advisory, so an unwritable home sweeps anyway.
+function acquireSweepLock(): (() => void) | null {
+  const file = path.join(path.dirname(stateFile()), 'worktree-sweep.lock');
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, String(process.pid), { flag: 'wx' });
+      return () => {
+        try {
+          if (fs.readFileSync(file, 'utf8') === String(process.pid)) fs.rmSync(file, { force: true });
+        } catch (_) {}
+      };
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') return () => {};
+      let holder = 0;
+      try {
+        holder = Number(fs.readFileSync(file, 'utf8'));
+      } catch (_) {}
+      if (Number.isInteger(holder) && holder > 0 && processAlive(holder)) return null;
+      fs.rmSync(file, { force: true });
+    }
+  }
+  return null;
+}
+
 export async function sweepWorktrees(data: HookInput, includeKnownProjects: boolean): Promise<string[]> {
+  const release = acquireSweepLock();
+  if (!release) return [];
+  try {
+    return await sweepWorktreesExclusively(data, includeKnownProjects);
+  } finally {
+    release();
+  }
+}
+
+async function sweepWorktreesExclusively(data: HookInput, includeKnownProjects: boolean): Promise<string[]> {
   const store = require(runtimeModule('store')) as Store;
   const { project: current, sessionPath } = currentProject(data, store);
   if (!current) return [];
@@ -317,6 +364,9 @@ export async function sweepWorktrees(data: HookInput, includeKnownProjects: bool
       if (!isCurrentProject) continue;
       if (result.remainingCandidates) {
         notices.push(`sidequest: ${result.remainingCandidates} worktree candidate(s) in ${project.name || project.slug} remain past this session's sweep budget; later sessions continue oldest first.`);
+      }
+      if (result.statusTimedOut) {
+        notices.push(`sidequest: worktree sweep for ${project.name || project.slug}: git status timed out on ${result.statusTimedOut} tree(s); they were kept as status_unknown and are read again next sweep.`);
       }
       if (result.skipped === 'repository_busy') {
         notices.push(`sidequest: skipped worktree sweep for ${project.name || project.slug}: the repository has an in-progress git operation.`);

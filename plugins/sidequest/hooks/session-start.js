@@ -300,6 +300,17 @@ function drainReport(cwd) {
 function sweepCwd(data) {
   return stringField(data, "cwd", "project_dir", "projectDir") || process.env.CLAUDE_PROJECT_DIR || process.cwd();
 }
+function spawnSweepWorker(data, mode) {
+  return (0, import_node_child_process.spawn)(process.execPath, [
+    import_node_path3.default.join(pluginRoot(), "hooks", "sweep-worktrees.js"),
+    "--cwd",
+    sweepCwd(data),
+    "--session",
+    stringField(data, "session_id", "sessionId"),
+    "--mode",
+    mode
+  ], { detached: true, stdio: "ignore", windowsHide: true });
+}
 async function runSweep(data) {
   const cwd = sweepCwd(data);
   const carried = drainReport(cwd) || [];
@@ -307,13 +318,7 @@ async function runSweep(data) {
   writeSweepProgress(cwd, EMPTY_SWEEP_PROGRESS);
   let child;
   try {
-    child = (0, import_node_child_process.spawn)(process.execPath, [
-      import_node_path3.default.join(pluginRoot(), "hooks", "sweep-worktrees.js"),
-      "--cwd",
-      cwd,
-      "--session",
-      stringField(data, "session_id", "sessionId")
-    ], { detached: true, stdio: "ignore", windowsHide: true });
+    child = spawnSweepWorker(data, "session-start");
   } catch (_) {
     clearSweepProgress(cwd);
     return [...carried, HANDOFF_FAILED_NOTICE];

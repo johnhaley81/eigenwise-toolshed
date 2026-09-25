@@ -345,6 +345,36 @@ function compactSchema(schema?: any, propertyMap = false): any {
 // context-packet.ts, including its measured response framing allowance.
 const LIST_RESULT_MAX_BYTES = MCP_TOOL_RESULT_PAYLOAD_MAX_BYTES;
 
+// A claim holder that closes its own ticket (done, release) is still running inside the tree it
+// closes, and deleting a running agent's working directory breaks its SubagentStop hook. So a claim
+// that was live when the close began keeps the tree for the detached sweep, which runs after the
+// executor exits; a claim the store already calls reclaimable is nobody's live work.
+function claimHeldLive(ticket?: any): boolean {
+  return Boolean(ticket?.claim?.by && !store.claimReclaimable(ticket));
+}
+
+// Ticket-close cleanup (SQ-51): integrate, groomClose, done, release and remove reclaim the ticket's
+// own worktree at zero age under the sweep's rules, and the session sweep stays the backstop.
+// `extraTicket` carries a ticket the board no longer lists, which is how remove describes its tree.
+async function cleanupClosedTicketWorktree(slug: string, projectPath: string, ticket: any, claimWasLive: boolean = false, extraTicket: any = null): Promise<void> {
+  try {
+    const dispatch = ticket?.dispatch;
+    if (!dispatch?.worktree || dispatch.sharedTree !== false || dispatch.continuation || store.boardConfig(slug)?.worktreeIsolation === false) return;
+    const tickets = [...store.worktreeGcTickets(), ...(extraTicket ? [extraTicket] : [])].map((candidate: any) => (
+      candidate.ref === ticket.ref && claimWasLive ? { ...candidate, claimLive: true } : candidate
+    ));
+    await worktrees.sweep(projectPath, tickets, {
+      execute: true,
+      currentPath: store.nearestRepoRoot(process.cwd()),
+      integrationTarget: store.ticketIntegrationTarget(slug, ticket),
+      minAgeMs: 0,
+      ticketRef: ticket.ref,
+    });
+  } catch (_) {
+    // The close has already been durably recorded. The session sweep remains the backstop.
+  }
+}
+
 function closeDispatchExecutor(ticket?: any) {
   const executor = store.canonicalPreparedDispatchExecutor(ticket);
   if (executor) agentsync.cleanupNativeAgents({ name: executor });
@@ -1107,6 +1137,8 @@ module.exports = {
   compactSchema,
   LIST_RESULT_MAX_BYTES,
   closeDispatchExecutor,
+  claimHeldLive,
+  cleanupClosedTicketWorktree,
   mutationAck,
   integrationBranchAck,
   outOfScopeComment,

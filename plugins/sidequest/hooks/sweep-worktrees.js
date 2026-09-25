@@ -131,6 +131,16 @@ function writeReport(cwd, notices) {
   } catch (_) {
   }
 }
+function appendReport(cwd, notices) {
+  if (!notices.length) return;
+  let carried = [];
+  try {
+    const parsed = JSON.parse(import_node_fs2.default.readFileSync(reportFile(cwd), "utf8"));
+    if (Array.isArray(parsed?.notices)) carried = parsed.notices.map((notice) => String(notice));
+  } catch (_) {
+  }
+  writeReport(cwd, [...carried, ...notices]);
+}
 
 // src/hooks/shared/worktree-sweep.ts
 var MAX_PROJECTS_PER_START = 3;
@@ -231,6 +241,14 @@ function currentProject(data, store) {
     sessionPath: sessionWorktreePath(start)
   };
 }
+function unregisterSweepSession(data) {
+  const id = sessionId(data);
+  if (!id) return;
+  const state = readState();
+  if (state.sessions) delete state.sessions[id];
+  if (state.reportedOrphans) delete state.reportedOrphans[id];
+  writeState(state);
+}
 function liveSessionPaths() {
   return Object.values(readState().sessions || {});
 }
@@ -258,7 +276,50 @@ function missingIntegrationTarget(error) {
 function sweepRule(order) {
   return `Cleanup classifies in this order: ${order.join(", ")}.`;
 }
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+function acquireSweepLock() {
+  const file = import_node_path3.default.join(import_node_path3.default.dirname(stateFile()), "worktree-sweep.lock");
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      import_node_fs3.default.mkdirSync(import_node_path3.default.dirname(file), { recursive: true });
+      import_node_fs3.default.writeFileSync(file, String(process.pid), { flag: "wx" });
+      return () => {
+        try {
+          if (import_node_fs3.default.readFileSync(file, "utf8") === String(process.pid)) import_node_fs3.default.rmSync(file, { force: true });
+        } catch (_) {
+        }
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") return () => {
+      };
+      let holder = 0;
+      try {
+        holder = Number(import_node_fs3.default.readFileSync(file, "utf8"));
+      } catch (_) {
+      }
+      if (Number.isInteger(holder) && holder > 0 && processAlive(holder)) return null;
+      import_node_fs3.default.rmSync(file, { force: true });
+    }
+  }
+  return null;
+}
 async function sweepWorktrees(data, includeKnownProjects) {
+  const release = acquireSweepLock();
+  if (!release) return [];
+  try {
+    return await sweepWorktreesExclusively(data, includeKnownProjects);
+  } finally {
+    release();
+  }
+}
+async function sweepWorktreesExclusively(data, includeKnownProjects) {
   const store = require(runtimeModule("store"));
   const { project: current, sessionPath } = currentProject(data, store);
   if (!current) return [];
@@ -337,6 +398,9 @@ async function sweepWorktrees(data, includeKnownProjects) {
       if (result.remainingCandidates) {
         notices.push(`sidequest: ${result.remainingCandidates} worktree candidate(s) in ${project.name || project.slug} remain past this session's sweep budget; later sessions continue oldest first.`);
       }
+      if (result.statusTimedOut) {
+        notices.push(`sidequest: worktree sweep for ${project.name || project.slug}: git status timed out on ${result.statusTimedOut} tree(s); they were kept as status_unknown and are read again next sweep.`);
+      }
       if (result.skipped === "repository_busy") {
         notices.push(`sidequest: skipped worktree sweep for ${project.name || project.slug}: the repository has an in-progress git operation.`);
       }
@@ -395,9 +459,23 @@ async function sessionStartMaintenance(data) {
   }
   return notices;
 }
+async function sessionEndSweep(data) {
+  try {
+    appendReport(String(data.cwd), await sweepWorktrees(data, false));
+  } catch (error) {
+    appendReport(String(data.cwd), [`sidequest: session-end worktree sweep failed: ${error instanceof Error ? error.message : String(error)}`]);
+  } finally {
+    unregisterSweepSession(data);
+  }
+}
 async function main() {
   const cwd = argument("cwd") || process.cwd();
-  const notices = await sessionStartMaintenance({ cwd, session_id: argument("session") });
+  const data = { cwd, session_id: argument("session") };
+  if (argument("mode") === "session-end") {
+    await sessionEndSweep(data);
+    return;
+  }
+  const notices = await sessionStartMaintenance(data);
   writeReport(cwd, notices);
 }
 main().catch((error) => {

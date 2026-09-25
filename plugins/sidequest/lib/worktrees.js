@@ -35,27 +35,36 @@ function atRiskStatusEntries(stdout, worktree, recordedLinks) {
   return parseWorktreeStatus(stdout).filter((entry) => !recordedLinks.some((link) => entry.path === link || entry.path.startsWith(`${link}/`))).filter((entry) => !installedDependencyCacheFile(worktree, entry));
 }
 function installedDependencyCacheFile(worktree, entry) {
-  if (entry.code !== "!!" || !dependencyCachePath(entry.path) || entry.path.endsWith("/")) return false;
-  const segments = entry.path.split(/[\\/]+/).filter(Boolean);
+  if (entry.code !== "!!" || !dependencyCachePath(entry.path)) return false;
+  return Boolean(ignoredEntryLeafInsideTree(worktree, entry.path)?.stats.isFile());
+}
+function ignoredEntryLeafInsideTree(worktree, relativePath) {
+  const segments = relativePath.split(/[\\/]+/).filter(Boolean);
   const canonicalWorktree = canonicalPath(worktree);
   let current = worktree;
   try {
     for (let depth = 0; depth < segments.length; depth += 1) {
       current = path.join(current, segments[depth]);
       let stats = nativeFs.lstatSync(current);
-      if (stats.isSymbolicLink()) {
+      const link = stats.isSymbolicLink();
+      if (link) {
         const resolved = linkTargetPath(current, nativeFs.readlinkSync(current));
-        if (!pathIsInside(canonicalWorktree, resolved)) return false;
+        if (!pathIsInside(canonicalWorktree, resolved)) return null;
         current = resolved;
         stats = nativeFs.lstatSync(current);
-        if (stats.isSymbolicLink()) return false;
+        if (stats.isSymbolicLink()) return null;
       }
-      if (depth === segments.length - 1) return stats.isFile();
+      if (depth === segments.length - 1) return { stats, link };
     }
   } catch (_) {
-    return false;
+    return null;
   }
-  return false;
+  return null;
+}
+function rebuildableIgnoredEntry(worktree, entry) {
+  if (entry.code !== "!!") return false;
+  const leaf = ignoredEntryLeafInsideTree(worktree, entry.path);
+  return Boolean(leaf && (leaf.link || !leaf.stats.isDirectory()));
 }
 function atRiskStatusEntriesSync(worktree, ticketOrDispatch = null) {
   const stdout = execFileSync("git", [...AT_RISK_STATUS_ARGUMENTS], {
@@ -102,6 +111,7 @@ const DEFAULT_RECOVERY_RETENTION_AGE_MS = 14 * 24 * 60 * 60 * 1e3;
 const WORKTREE_SWEEP_CLASSIFICATION_ORDER = Object.freeze([
   "status_unknown",
   "tracked_changes",
+  "ticket_closed_settled",
   "too_young",
   "upstream_ambiguous",
   "upstream_unavailable",
@@ -116,32 +126,55 @@ const WORKTREE_SWEEP_CLASSIFICATION_ORDER = Object.freeze([
   "not_integrated"
 ]);
 const QUARANTINE_RETRY_INTERVAL_MS = 24 * 60 * 60 * 1e3;
-function git(cwd, args, input, environment) {
+const SWEEP_CLASSIFICATION_CONCURRENCY = 4;
+const DEFAULT_STATUS_TIMEOUT_MS = 6e4;
+const GIT_TIMEOUT_MS = 12e4;
+function git(cwd, args, input, environment, timeoutMs = GIT_TIMEOUT_MS) {
   return new Promise((resolve) => {
     const child = spawn("git", ["-c", "core.editor=true", ...args], {
       cwd,
       env: { ...process.env, GIT_EDITOR: "true", GIT_SEQUENCE_EDITOR: "true", ...environment },
-      timeout: 12e4,
       windowsHide: true,
       stdio: [input == null ? "ignore" : "pipe", "pipe", "pipe"]
     });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
     const stdout = [];
     const stderr = [];
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     if (input != null) child.stdin.end(input);
     child.once("error", (error) => {
+      clearTimeout(timer);
       resolve({ ok: false, status: null, stdout: "", stderr: String(error.message || "").trim() });
     });
     child.once("close", (status) => {
+      clearTimeout(timer);
       resolve({
-        ok: status === 0,
+        ok: status === 0 && !timedOut,
         status,
         stdout: Buffer.concat(stdout).toString("utf8").trim(),
-        stderr: Buffer.concat(stderr).toString("utf8").trim()
+        stderr: timedOut ? `git ${args[0]} timed out after ${timeoutMs}ms` : Buffer.concat(stderr).toString("utf8").trim(),
+        ...timedOut ? { timedOut } : {}
       });
     });
   });
+}
+async function mapWithConcurrency(items, limit, map) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await map(items[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
+  return results;
 }
 function pathIsInside(root, candidate) {
   const relative = path.relative(root, candidate);
@@ -521,7 +554,10 @@ async function resolvedIntegrationUpstream(repo, options) {
   throw new Error("worktree sweep requires the board integration target.");
 }
 function finalTicket(ticket) {
-  return Boolean(ticket && (ticket.archived || ticket.status === "done"));
+  return Boolean(ticket && (ticket.archived || ticket.removed || ticket.status === "done"));
+}
+function releasedTicket(ticket) {
+  return Boolean(ticket && !liveClaimTicket(ticket) && ticket.dispatch?.outcome === "released" && dispatchHasTerminalLifecycleAuthority(ticket.dispatch));
 }
 function liveClaimTicket(ticket) {
   return Boolean(ticket && ticket.claimLive);
@@ -605,9 +641,9 @@ async function worktreeAge(pathname) {
     return null;
   }
 }
-async function inspectWorktree(entry, ticket, minAgeMs, upstream, notIntegratedSalvageAgeMs) {
+async function inspectWorktree(entry, ticket, minAgeMs, upstream, notIntegratedSalvageAgeMs, statusTimeoutMs = DEFAULT_STATUS_TIMEOUT_MS) {
   const [cleanResult, ageMs, patch, reachable] = await Promise.all([
-    git(entry.worktree, [...AT_RISK_STATUS_ARGUMENTS]),
+    git(entry.worktree, [...AT_RISK_STATUS_ARGUMENTS], void 0, void 0, statusTimeoutMs),
     worktreeAge(entry.worktree),
     upstream ? patchEquivalence(entry.worktree, "HEAD", upstream) : Promise.resolve({ equivalent: false, ahead: null, equivalentCommits: 0, unmatchedCommits: null }),
     upstream ? reachableFrom(entry.worktree, "HEAD", upstream) : Promise.resolve(false)
@@ -616,8 +652,10 @@ async function inspectWorktree(entry, ticket, minAgeMs, upstream, notIntegratedS
   return {
     clean: cleanResult.ok && statusEntries.length === 0,
     statusKnown: cleanResult.ok,
+    statusTimedOut: Boolean(cleanResult.timedOut),
     trackedChanges: statusEntries.some((status) => !UNVERSIONED_STATUS_CODES.has(status.code)),
     untrackedOrIgnored: statusEntries.some((status) => UNVERSIONED_STATUS_CODES.has(status.code)),
+    onlyRebuildableIgnored: cleanResult.ok && statusEntries.every((status) => rebuildableIgnoredEntry(entry.worktree, status)),
     ahead: patch.ahead,
     reachable,
     patchEquivalent: patch.equivalent,
@@ -631,7 +669,7 @@ async function inspectWorktree(entry, ticket, minAgeMs, upstream, notIntegratedS
   };
 }
 function factsForEntry(facts) {
-  const { statusKnown: _statusKnown, trackedChanges: _trackedChanges, untrackedOrIgnored: _untrackedOrIgnored, ...entryFacts } = facts;
+  const { statusKnown: _statusKnown, trackedChanges: _trackedChanges, untrackedOrIgnored: _untrackedOrIgnored, onlyRebuildableIgnored: _onlyRebuildableIgnored, ...entryFacts } = facts;
   return entryFacts;
 }
 async function patchEquivalence(repo, revision, upstream) {
@@ -703,13 +741,27 @@ function classifiedWorktreeEntry(entry, ticket, facts, action, reason, current) 
 function liveWorktreeKeepReason(entry, ticket, lease) {
   if (entry.locked) return "locked";
   if (lease.liveness.status === "live") return "live_session";
-  if (ticket && !finalTicket(ticket)) return "active_ticket";
+  if (ticket && !finalTicket(ticket) && !releasedTicket(ticket)) return "active_ticket";
   if (lease.identity.status === "bound" && lease.phase !== "terminal") return "active_ticket";
   return null;
 }
-async function classifyWorktree(repo, tickets, entry, currentPath, minAgeMs, upstream, upstreamSafetyReason, livePaths = [], notIntegratedSalvageAgeMs = DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS, registeredWorktrees = []) {
+function closedTicketCandidate(tickets, entry) {
+  if (entry.orphanDirectory) return false;
   const ticket = ticketForWorktree(tickets, entry);
-  const facts = await inspectWorktree(entry, ticket, minAgeMs, upstream, notIntegratedSalvageAgeMs);
+  return Boolean(ticket && !liveClaimTicket(ticket) && (finalTicket(ticket) || releasedTicket(ticket)));
+}
+async function closedTicketHeadSettled(entry, ticket, facts) {
+  if (facts.reachable) return true;
+  const head = String(entry.head || "").trim();
+  const base = String(ticket?.dispatch?.baseCommit || "").trim();
+  if (head && base.length >= 7 && head.startsWith(base)) return true;
+  const ref = String(ticket?.ref || "").trim();
+  if (!head || !ref || !finalTicket(ticket)) return false;
+  return (await git(entry.worktree, ["merge-base", "--is-ancestor", head, `refs/sidequest/${ref}`])).ok;
+}
+async function classifyWorktree(repo, tickets, entry, currentPath, minAgeMs, upstream, upstreamSafetyReason, livePaths = [], notIntegratedSalvageAgeMs = DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS, registeredWorktrees = [], statusTimeoutMs = DEFAULT_STATUS_TIMEOUT_MS) {
+  const ticket = ticketForWorktree(tickets, entry);
+  const facts = await inspectWorktree(entry, ticket, minAgeMs, upstream, notIntegratedSalvageAgeMs, statusTimeoutMs);
   const worktreePath2 = canonicalPath(entry.worktree);
   const current = worktreePath2 === canonicalPath(currentPath);
   if (current) return classifiedWorktreeEntry(entry, ticket, facts, "keep", "current_worktree", true);
@@ -733,6 +785,10 @@ async function classifyWorktree(repo, tickets, entry, currentPath, minAgeMs, ups
   let reason = "not_integrated";
   if (!facts.statusKnown) reason = "status_unknown";
   else if (facts.trackedChanges) reason = "tracked_changes";
+  else if ((finalTicket(ticket) || releasedTicket(ticket)) && facts.onlyRebuildableIgnored && await closedTicketHeadSettled(entry, ticket, facts)) {
+    action = "remove";
+    reason = "ticket_closed_settled";
+  } else if (releasedTicket(ticket)) reason = "active_ticket";
   else if (!facts.oldEnough) reason = "too_young";
   else if (upstreamSafetyReason) reason = upstreamSafetyReason;
   else if (facts.untrackedOrIgnored) {
@@ -740,7 +796,7 @@ async function classifyWorktree(repo, tickets, entry, currentPath, minAgeMs, ups
       action = "quarantine";
       reason = "untracked_quarantined";
     } else reason = "untracked_recent";
-  } else if (ticket?.archived) {
+  } else if (ticket?.archived || ticket?.removed) {
     action = "remove";
     reason = "ticket_archived";
   } else if (ticket?.status === "done") {
@@ -1302,11 +1358,11 @@ function worktreeSymbolicLinks(worktree) {
   };
   return walk(worktree) ? links : null;
 }
-async function lateContentInMovedWorktree(destination, classifiedHead, recordedLinks, branch) {
+async function lateContentInMovedWorktree(destination, classifiedHead, recordedLinks, branch, rebuildableIgnoredAllowed = false) {
   const blockedBy = (blocked) => ({ blocked, head: null, branchTip: null });
   const status = await git(destination, [...AT_RISK_STATUS_ARGUMENTS]);
   if (!status.ok) return blockedBy(`the moved tree could not be read again: ${status.stderr || `git status exited ${status.status}`}`);
-  const held = atRiskStatusEntries(status.stdout, destination, recordedLinks);
+  const held = atRiskStatusEntries(status.stdout, destination, recordedLinks).filter((entry) => !(rebuildableIgnoredAllowed && rebuildableIgnoredEntry(destination, entry)));
   if (held.length) return blockedBy(`the moved tree holds ${held.length} entries the classification did not see, starting with ${held[0].code} ${held[0].path}`);
   const head = await git(destination, ["rev-parse", "HEAD"]);
   if (!head.ok) return blockedBy(`the moved tree's HEAD could not be read again: ${head.stderr || `git rev-parse exited ${head.status}`}`);
@@ -1664,6 +1720,69 @@ function sweepProgress(entries, removed, status) {
 function reportSweepProgress(options, entries, removed, status) {
   if (typeof options.onProgress === "function") options.onProgress(sweepProgress(entries, removed, status));
 }
+const DEFAULT_WORKTREE_BUDGET_MAX_COUNT = 100;
+const DEFAULT_WORKTREE_BUDGET_MAX_BYTES = 200 * 1024 ** 3;
+const WORKTREE_BYTES_MEASURE_INTERVAL_MS = 60 * 60 * 1e3;
+function worktreeBytesSnapshotFile(repository) {
+  return path.join(sidequestHome(), "worktree-budget", `${worktreeProjectSlug(canonicalPath(repository))}.json`);
+}
+function readWorktreeBytesSnapshot(repository) {
+  try {
+    const snapshot = JSON.parse(nativeFs.readFileSync(worktreeBytesSnapshotFile(repository), "utf8"));
+    return Number.isFinite(snapshot?.bytes) && Number.isFinite(Date.parse(snapshot?.measuredAt)) ? snapshot : null;
+  } catch (_) {
+    return null;
+  }
+}
+async function recordWorktreeBytes(repository) {
+  const previous = readWorktreeBytesSnapshot(repository);
+  if (previous && Date.now() - Date.parse(previous.measuredAt) < WORKTREE_BYTES_MEASURE_INTERVAL_MS) return;
+  try {
+    let bytes = 0;
+    for (const root of agentWorktreeRoots(repository)) bytes += await directoryBytes(root);
+    const file = worktreeBytesSnapshotFile(repository);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify({ bytes, measuredAt: (/* @__PURE__ */ new Date()).toISOString() }));
+  } catch (_) {
+  }
+}
+function agentWorktreeDirectories(repository) {
+  const now = Date.now();
+  return agentWorktreeRoots(repository).flatMap((root) => {
+    try {
+      return nativeFs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name.startsWith("agent-")).map((entry) => {
+        const pathname = path.join(root, entry.name);
+        return { path: pathname, ageMs: Math.max(0, now - nativeFs.statSync(pathname).mtimeMs) };
+      });
+    } catch (_) {
+      return [];
+    }
+  });
+}
+function positiveLimit(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 1 ? Math.floor(number) : fallback;
+}
+function formatGigabytes(bytes) {
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+}
+function worktreeBudgetRefusal(repository, tickets, config = {}) {
+  const maxCount = positiveLimit(config?.worktreeBudgetMaxCount, DEFAULT_WORKTREE_BUDGET_MAX_COUNT);
+  const maxBytes = positiveLimit(config?.worktreeBudgetMaxBytes, DEFAULT_WORKTREE_BUDGET_MAX_BYTES);
+  const trees = agentWorktreeDirectories(repository);
+  const snapshot = readWorktreeBytesSnapshot(repository);
+  const overCount = trees.length >= maxCount;
+  const overBytes = Boolean(snapshot && snapshot.bytes >= maxBytes);
+  if (!overCount && !overBytes) return null;
+  const usage = [
+    overCount ? `${trees.length} agent worktrees against a maximum of ${maxCount}` : "",
+    overBytes ? `${formatGigabytes(snapshot.bytes)} measured ${snapshot.measuredAt} against a maximum of ${formatGigabytes(maxBytes)}` : ""
+  ].filter(Boolean).join(" and ");
+  const oldestFirst = (left, right) => right.ageMs - left.ageMs || left.path.localeCompare(right.path);
+  const deletable = trees.map((tree) => ({ ...tree, ticket: ticketForWorktree(tickets, { worktree: tree.path }) })).filter((tree) => closedTicketCandidate(tickets, { worktree: tree.path })).sort(oldestFirst).slice(0, 3).map((tree) => `${tree.path} (${tree.ticket.ref} ${tree.ticket.archived || tree.ticket.status === "done" ? "done" : "released"}, ${Math.floor(tree.ageMs / 36e5)}h old)`);
+  const named = deletable.length ? `Oldest deletable: ${deletable.join("; ")}.` : `No tree belongs to a closed ticket yet; the oldest are ${[...trees].sort(oldestFirst).slice(0, 3).map((tree) => tree.path).join("; ")}.`;
+  return `worktree budget exceeded for ${repository}: ${usage}. ${named} Reclaim them with \`sidequest worktrees sweep --yes --project "${repository}"\`, or raise the budget with \`sidequest board-config --project "${repository}" --worktree-budget-max-count <n> --worktree-budget-max-bytes <bytes>\`.`;
+}
 async function sweep(repo, tickets, options = {}) {
   const minAgeMs = Number.isFinite(Number(options.minAgeMs)) && Number(options.minAgeMs) >= 0 ? Number(options.minAgeMs) : DEFAULT_MIN_AGE_MS;
   const notIntegratedSalvageAgeMs = Number.isFinite(Number(options.notIntegratedSalvageAgeMs)) && Number(options.notIntegratedSalvageAgeMs) >= 0 ? Number(options.notIntegratedSalvageAgeMs) : DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS;
@@ -1685,6 +1804,7 @@ async function sweep(repo, tickets, options = {}) {
       strayDirectories: [],
       retainedBranches: [],
       remainingCandidates: 0,
+      statusTimedOut: 0,
       orphanBranches: [],
       removed: [],
       salvaged: [],
@@ -1715,8 +1835,12 @@ async function sweep(repo, tickets, options = {}) {
   const orphanCandidates = options.ticketRef ? [] : await orphanDirectories(repo, registered);
   const allCandidates = [...candidates, ...orphanCandidates];
   const maxCandidates = Number.isFinite(Number(options.maxCandidates)) && Number(options.maxCandidates) > 0 ? Math.floor(Number(options.maxCandidates)) : allCandidates.length;
-  const agedCandidates = await Promise.all(allCandidates.map(async (entry) => ({ entry, ageMs: await worktreeAge(entry.worktree) ?? 0 })));
-  agedCandidates.sort((left, right) => right.ageMs - left.ageMs || String(left.entry.worktree).localeCompare(String(right.entry.worktree)));
+  const agedCandidates = await Promise.all(allCandidates.map(async (entry) => ({
+    entry,
+    ageMs: await worktreeAge(entry.worktree) ?? 0,
+    closed: closedTicketCandidate(tickets, entry)
+  })));
+  agedCandidates.sort((left, right) => Number(right.closed) - Number(left.closed) || right.ageMs - left.ageMs || String(left.entry.worktree).localeCompare(String(right.entry.worktree)));
   const boundedCandidates = agedCandidates.slice(0, maxCandidates).map((candidate) => candidate.entry);
   const remainingCandidates = agedCandidates.length - boundedCandidates.length;
   const livePaths = Array.isArray(options.livePaths) ? options.livePaths.map((pathname) => String(pathname)) : [];
@@ -1729,15 +1853,17 @@ async function sweep(repo, tickets, options = {}) {
     current: entry.worktree,
     reason
   });
-  const entries = await Promise.all(boundedCandidates.map(async (entry) => {
+  const statusTimeoutMs = Number.isFinite(Number(options.statusTimeoutMs)) && Number(options.statusTimeoutMs) > 0 ? Number(options.statusTimeoutMs) : DEFAULT_STATUS_TIMEOUT_MS;
+  const entries = await mapWithConcurrency(boundedCandidates, SWEEP_CLASSIFICATION_CONCURRENCY, async (entry) => {
     reportSweepProgress(options, classified, removed, classificationStatus(entry, null));
-    const classifiedEntry = entry.orphanDirectory ? await classifyOrphanDirectory(tickets, entry, livePaths, minAgeMs) : await classifyWorktree(repo, tickets, entry, options.currentPath || process.cwd(), minAgeMs, comparison, upstreamSafetyReason, livePaths, notIntegratedSalvageAgeMs, [...registered]);
+    const classifiedEntry = entry.orphanDirectory ? await classifyOrphanDirectory(tickets, entry, livePaths, minAgeMs) : await classifyWorktree(repo, tickets, entry, options.currentPath || process.cwd(), minAgeMs, comparison, upstreamSafetyReason, livePaths, notIntegratedSalvageAgeMs, [...registered], statusTimeoutMs);
     classifiedEntry.upstream = upstream;
     classifiedEntry.upstreamFallback = upstreamFallback;
     classified.push(classifiedEntry);
     reportSweepProgress(options, classified, removed, classificationStatus(entry, classifiedEntry.reason));
     return classifiedEntry;
-  }));
+  });
+  const statusTimedOut = entries.filter((entry) => entry.statusTimedOut).length;
   const runsOrphanPass = !(options.ticketRef || upstreamSafetyReason);
   const branchesLosingTheirWorktree = new Set(entries.filter((candidate) => candidate.action === "remove" || candidate.action === "salvage").map((candidate) => localBranchName(candidate.branch)).filter((branch) => !!branch));
   const branchesKeepingTheirWorktree = new Set(worktreeList.map((entry) => localBranchName(entry.branch)).filter((branch) => !!branch).filter((branch) => !branchesLosingTheirWorktree.has(branch)));
@@ -1848,7 +1974,7 @@ async function sweep(repo, tickets, options = {}) {
       }
       const classifiedReason = entry.reason;
       const branch = localBranchName(entry.branch);
-      const movedRead = await lateContentInMovedWorktree(destination, entry.head, recordedLinks, branch);
+      const movedRead = await lateContentInMovedWorktree(destination, entry.head, recordedLinks, branch, classifiedReason === "ticket_closed_settled");
       if (movedRead.blocked) {
         await park("late_content_quarantined", `classified ${classifiedReason}, but ${movedRead.blocked}, so the moved tree was parked instead of deleted`);
         continue;
@@ -1914,6 +2040,7 @@ async function sweep(repo, tickets, options = {}) {
     }
   }
   const strayDirectories = options.ticketRef ? [] : await sweepStrayWorktreeHome(repo, execute, failures);
+  if (execute && !options.ticketRef) await recordWorktreeBytes(repo);
   reportSweepProgress(options, entries, removed, completeStatus);
   return {
     dryRun: !execute,
@@ -1925,6 +2052,7 @@ async function sweep(repo, tickets, options = {}) {
     strayDirectories,
     retainedBranches,
     remainingCandidates,
+    statusTimedOut,
     orphanBranches,
     removed,
     salvaged,
@@ -1941,9 +2069,10 @@ async function sweep(repo, tickets, options = {}) {
       retainedBranches: retainedBranches.length,
       prunedOrphanBranches: prunedOrphanBranches.length,
       removedStrayDirectories: strayDirectories.filter((entry) => entry.action === "remove").length,
+      statusTimedOut,
       ...recoveryCounts(recovery)
     },
     failures
   };
 }
-module.exports = { WORKTREE_SWEEP_CLASSIFICATION_ORDER, retainedBranchExplanation, retainedWorktreeResumeDecision, DEFAULT_MIN_AGE_MS, DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS, DEFAULT_RECOVERY_RETENTION_AGE_MS, gitBashPath, canonicalPath, worktreeRoot, legacyWorktreeRoot, agentWorktreePath, agentWorktreeCandidates, agentIdFromWorktreePath, resolvedAgentWorktree, namedWorktreePath, agentWorktreeRoots, parseWorktreeList, isAgentWorktree, ignoredPathsMissingFromWorktree, dependencyLinkSafety, releaseQuarantinedDependencyLinks, provisionWorktree, preferredWorktreeIntegrationTarget, classifyWorktree, advanceIntegrationBranch, reclaimUnclaimedDispatchWorktree, quarantineCandidate, storageStatus, sweep };
+module.exports = { WORKTREE_SWEEP_CLASSIFICATION_ORDER, DEFAULT_WORKTREE_BUDGET_MAX_COUNT, DEFAULT_WORKTREE_BUDGET_MAX_BYTES, worktreeBudgetRefusal, retainedBranchExplanation, retainedWorktreeResumeDecision, DEFAULT_MIN_AGE_MS, DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS, DEFAULT_RECOVERY_RETENTION_AGE_MS, gitBashPath, canonicalPath, worktreeRoot, legacyWorktreeRoot, agentWorktreePath, agentWorktreeCandidates, agentIdFromWorktreePath, resolvedAgentWorktree, namedWorktreePath, agentWorktreeRoots, parseWorktreeList, isAgentWorktree, ignoredPathsMissingFromWorktree, dependencyLinkSafety, releaseQuarantinedDependencyLinks, provisionWorktree, preferredWorktreeIntegrationTarget, classifyWorktree, advanceIntegrationBranch, reclaimUnclaimedDispatchWorktree, quarantineCandidate, storageStatus, sweep };

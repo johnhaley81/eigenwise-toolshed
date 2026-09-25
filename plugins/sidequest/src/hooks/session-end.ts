@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { readStdin, stringField } from './shared/input.js';
 import { runtimeModule } from './shared/paths.js';
-import { sweepWorktrees, unregisterSweepSession } from './shared/worktree-sweep.js';
+import { detachSessionEndSweep, HANDOFF_FAILED_NOTICE } from './shared/sweep-handoff.js';
+import { unregisterSweepSession } from './shared/worktree-sweep.js';
 
 async function main(): Promise<void> {
   const data = readStdin();
@@ -25,13 +26,12 @@ async function main(): Promise<void> {
     notices.push(`sidequest: session-end reconciliation failed: ${(error && error.message) || error}`);
   }
 
-  try {
-    notices.push(...await sweepWorktrees(data, false));
-  } catch (error: any) {
-    notices.push(`sidequest: session-end worktree sweep failed: ${(error && error.message) || error}`);
+  // The worker unregisters this session once its sweep is done, so the session's own tree stays
+  // protected while the sweep runs, exactly as when the hook swept inline.
+  if (!detachSessionEndSweep(data)) {
+    unregisterSweepSession(data);
+    notices.push(HANDOFF_FAILED_NOTICE);
   }
-
-  unregisterSweepSession(data);
   if (notices.length) console.error(notices.join('\n'));
 }
 

@@ -156,8 +156,42 @@ export function drainReport(cwd: string): string[] | null {
   }
 }
 
+// A SessionEnd sweep has no session left to tell, so it adds to whatever report the next start drains.
+export function appendReport(cwd: string, notices: string[]): void {
+  if (!notices.length) return;
+  let carried: string[] = [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(reportFile(cwd), 'utf8'));
+    if (Array.isArray(parsed?.notices)) carried = parsed.notices.map((notice: unknown) => String(notice));
+  } catch (_) {}
+  writeReport(cwd, [...carried, ...notices]);
+}
+
 function sweepCwd(data: HookInput): string {
   return stringField(data, 'cwd', 'project_dir', 'projectDir') || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+}
+
+function spawnSweepWorker(data: HookInput, mode: 'session-start' | 'session-end') {
+  return spawn(process.execPath, [
+    path.join(pluginRoot(), 'hooks', 'sweep-worktrees.js'),
+    '--cwd', sweepCwd(data),
+    '--session', stringField(data, 'session_id', 'sessionId'),
+    '--mode', mode,
+  ], { detached: true, stdio: 'ignore', windowsHide: true });
+}
+
+// SessionEnd has a 10 s budget and is cancelled on every exit that runs past it, which is what a
+// sweep over dozens of worktrees did (SQ-51). The worker owns the sweep and the session's
+// unregistration; the hook only starts it. False means nothing was started.
+export function detachSessionEndSweep(data: HookInput): boolean {
+  try {
+    const child = spawnSweepWorker(data, 'session-end');
+    child.once('error', () => {});
+    child.unref();
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 // Always runs the sweep in a detached child and waits only up to the deadline. The
@@ -170,11 +204,7 @@ export async function runSweep(data: HookInput): Promise<string[]> {
   writeSweepProgress(cwd, EMPTY_SWEEP_PROGRESS);
   let child;
   try {
-    child = spawn(process.execPath, [
-      path.join(pluginRoot(), 'hooks', 'sweep-worktrees.js'),
-      '--cwd', cwd,
-      '--session', stringField(data, 'session_id', 'sessionId'),
-    ], { detached: true, stdio: 'ignore', windowsHide: true });
+    child = spawnSweepWorker(data, 'session-start');
   } catch (_) {
     clearSweepProgress(cwd);
     return [...carried, HANDOFF_FAILED_NOTICE];

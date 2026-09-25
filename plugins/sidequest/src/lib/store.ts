@@ -46,7 +46,7 @@ const {
 const { DEFAULT_CATEGORIES, ROUTING_PROFILE_SEED_REVISION, starterRoutingProfilesFor } = require('./category-defaults.js');
 const commitScope = require('./commit-scope.js');
 const { commitPaths } = commitScope;
-const { preferredWorktreeIntegrationTarget, agentWorktreePath, agentWorktreeCandidates, agentIdFromWorktreePath, resolvedAgentWorktree, reclaimUnclaimedDispatchWorktree, retainedWorktreeResumeDecision } = require('./worktrees.js');
+const { preferredWorktreeIntegrationTarget, agentWorktreePath, agentWorktreeCandidates, agentIdFromWorktreePath, resolvedAgentWorktree, reclaimUnclaimedDispatchWorktree, retainedWorktreeResumeDecision, worktreeBudgetRefusal } = require('./worktrees.js');
 const { canonicalPath, checkoutInstanceIdentity, createWorktreeLease, isCanonicalRegisteredWorktree } = require('./kernel/worktree.js');
 const { reviewLockMessage } = require('./kernel/review-binding.js');
 const { migrateIfNeeded } = require('./migrate.js');
@@ -642,6 +642,7 @@ const {
   agentIdFromWorktreePath,
   resolvedAgentWorktree,
   reclaimUnclaimedDispatchWorktree,
+  dispatchWorktreeBudgetRefusal: (projectPath: string, slug: string) => worktreeBudgetRefusal(projectPath, worktreeGcTickets(), boardConfig(slug)),
   legacyCategoryForComplexity: (...args: any[]) => legacyCategoryForComplexity(...args),
   listProjects,
   listTickets,

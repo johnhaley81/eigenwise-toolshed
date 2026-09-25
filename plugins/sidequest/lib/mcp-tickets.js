@@ -57,7 +57,9 @@ const {
   worktreeRoot,
   verifyEmbedsWorktreeRoot,
   withoutCategories,
-  snapshotContextRetrieval
+  snapshotContextRetrieval,
+  cleanupClosedTicketWorktree,
+  claimHeldLive
 } = require("./mcp-shared");
 function sameBasenameSiblingDetails(project, ticket, projectPath, tool) {
   const details = store.scopeConsumerWarningDetails(ticket, projectPath);
@@ -360,7 +362,7 @@ const tools = [
       if (!store.deleteTicket(slug, ticket.id, { allowLiveClaimDeletion: args.force === true })) {
         throw new Error(`remove: could not delete "${ticket.ref}" from ${meta.name}.`);
       }
-      return { ok: true, ref };
+      return cleanupClosedTicketWorktree(slug, meta.path, ticket, claimHeldLive(ticket), { ...ticket, removed: true, claimLive: false }).then(() => ({ ok: true, ref }));
     }
   },
   {

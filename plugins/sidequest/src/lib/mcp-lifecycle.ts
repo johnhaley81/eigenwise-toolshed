@@ -54,6 +54,8 @@ const {
   requiredReleaseReason,
   worktreeRoot,
   verifyEmbedsWorktreeRoot,
+  cleanupClosedTicketWorktree,
+  claimHeldLive,
   withoutCategories,
   CATEGORY_TAXONOMY_WARNING,
   state,
@@ -132,25 +134,6 @@ function deliveredAck(slug: string, result: any, integration: any, changed: any 
     message,
     ...changed,
   });
-}
-
-async function cleanupDeliveredWorktree(slug: string, projectPath: string, ticket: any, claimWasLive: boolean = false): Promise<void> {
-  try {
-    const dispatch = ticket?.dispatch;
-    if (!dispatch?.worktree || dispatch.sharedTree !== false || dispatch.continuation || store.boardConfig(slug)?.worktreeIsolation === false) return;
-    const tickets = store.worktreeGcTickets().map((candidate: any) => (
-      candidate.ref === ticket.ref && claimWasLive ? { ...candidate, claimLive: true } : candidate
-    ));
-    await worktrees.sweep(projectPath, tickets, {
-      execute: true,
-      currentPath: store.nearestRepoRoot(process.cwd()),
-      integrationTarget: store.ticketIntegrationTarget(slug, ticket),
-      minAgeMs: 0,
-      ticketRef: ticket.ref,
-    });
-  } catch (_) {
-    // Delivery has already been durably recorded. SessionStart remains the backstop.
-  }
 }
 
 function objectProperties(value: unknown): Record<string, unknown> {
@@ -627,7 +610,7 @@ const tools: ToolDefinition[] = [
       },
       required: ['ref', 'by', 'body'],
     },
-    handler(args) {
+    async handler(args) {
       const { slug, meta } = resolveLifecycleProject(args.project, args, 'done');
       const by = requireBy(args, 'done');
       const body = requiredFinalReport(args, 'done');
@@ -655,7 +638,10 @@ const tools: ToolDefinition[] = [
           res.message = `${res.message} ${noOp.detail}`;
         }
       }
-      if (res.ok) closeDispatchExecutor(ticket);
+      if (res.ok) {
+        closeDispatchExecutor(ticket);
+        await cleanupClosedTicketWorktree(slug, meta.path, res.ticket, claimHeldLive(ticket));
+      }
       return mutationAck(slug, res);
     },
   },
@@ -761,6 +747,8 @@ const tools: ToolDefinition[] = [
         } catch (error: any) {
           res.worktreeSweep = { failures: [{ path: null, message: (error && error.message) || String(error) }] };
         }
+      } else if (res.ok) {
+        await cleanupClosedTicketWorktree(slug, meta.path, res.ticket, claimHeldLive(ticket));
       }
       return mutationAck(slug, res, res.ok
         ? Object.assign(
@@ -793,7 +781,7 @@ const tools: ToolDefinition[] = [
       },
       required: ['ref', 'by'],
     },
-    handler(args) {
+    async handler(args) {
       const { slug, meta } = resolveLifecycleProject(args.project, args, 'release');
       const by = requireBy(args, 'release');
       const evidence = store.technicalBlockerRelease(Object.assign({}, args, { releaseKind: args.kind }), { requireClassification: true });
@@ -812,7 +800,10 @@ const tools: ToolDefinition[] = [
         source: 'mcp',
         sessionId: sessionOf(args),
       });
-      if (res.ok) closeDispatchExecutor(ticket);
+      if (res.ok) {
+        closeDispatchExecutor(ticket);
+        await cleanupClosedTicketWorktree(slug, meta.path, res.ticket, claimHeldLive(ticket));
+      }
       return mutationAck(slug, res);
     },
   },
@@ -1171,7 +1162,7 @@ const tools: ToolDefinition[] = [
         for (const [index, closure] of closures.entries()) {
           if (!closure.ok) continue;
           closeDispatchExecutor(closure.ticket);
-          await cleanupDeliveredWorktree(slug, meta.path, closure.ticket, Boolean(ticketsBeforeClosure[index]?.claim?.by));
+          await cleanupClosedTicketWorktree(slug, meta.path, closure.ticket, Boolean(ticketsBeforeClosure[index]?.claim?.by));
         }
         return deliveredAck(slug, failedClosure || closures[0], delivery.integration, {
           verify: delivery.integration.verify,
@@ -1241,7 +1232,7 @@ const tools: ToolDefinition[] = [
         });
         if (closed.ok) {
           closeDispatchExecutor(recorded.ticket);
-          await cleanupDeliveredWorktree(slug, meta.path, closed.ticket, Boolean(deliveryTicket?.claim?.by));
+          await cleanupClosedTicketWorktree(slug, meta.path, closed.ticket, Boolean(deliveryTicket?.claim?.by));
         }
         return deliveredAck(slug, closed, recorded.integration, {
           verify: recorded.integration.verify,
@@ -1289,7 +1280,7 @@ const tools: ToolDefinition[] = [
       });
       if (closed.ok) {
         closeDispatchExecutor(delivery.ticket);
-        await cleanupDeliveredWorktree(slug, meta.path, closed.ticket, Boolean(deliveryTicket?.claim?.by));
+        await cleanupClosedTicketWorktree(slug, meta.path, closed.ticket, Boolean(deliveryTicket?.claim?.by));
       }
       return deliveredAck(slug, closed, integration, {
         verify: verification.verify,

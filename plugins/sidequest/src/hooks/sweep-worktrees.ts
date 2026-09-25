@@ -3,8 +3,8 @@
 // cannot make Claude discard the briefing with the hook's entire stdout.
 import type { HookInput } from './shared/input.js';
 import { runtimeModule } from './shared/paths.js';
-import { sweepWorktrees } from './shared/worktree-sweep.js';
-import { writeReport } from './shared/sweep-handoff.js';
+import { sweepWorktrees, unregisterSweepSession } from './shared/worktree-sweep.js';
+import { appendReport, writeReport } from './shared/sweep-handoff.js';
 
 interface Store {
   sweepStaleClaims: (options: { source: string }) => unknown;
@@ -62,9 +62,26 @@ async function sessionStartMaintenance(data: HookInput): Promise<string[]> {
   return notices;
 }
 
+// SessionEnd already reconciled claims and agents before it detached this worker, so only the
+// current project's sweep is left, and its notices wait for the next session start.
+async function sessionEndSweep(data: HookInput): Promise<void> {
+  try {
+    appendReport(String(data.cwd), await sweepWorktrees(data, false));
+  } catch (error: unknown) {
+    appendReport(String(data.cwd), [`sidequest: session-end worktree sweep failed: ${error instanceof Error ? error.message : String(error)}`]);
+  } finally {
+    unregisterSweepSession(data);
+  }
+}
+
 async function main(): Promise<void> {
   const cwd = argument('cwd') || process.cwd();
-  const notices = await sessionStartMaintenance({ cwd, session_id: argument('session') });
+  const data = { cwd, session_id: argument('session') };
+  if (argument('mode') === 'session-end') {
+    await sessionEndSweep(data);
+    return;
+  }
+  const notices = await sessionStartMaintenance(data);
   writeReport(cwd, notices);
 }
 

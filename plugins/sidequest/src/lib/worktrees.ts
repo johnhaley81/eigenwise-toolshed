@@ -65,29 +65,47 @@ function atRiskStatusEntries(stdout: string, worktree: string, recordedLinks: re
 // `npm ci` writes one per `node_modules/.bin` entry (SQ-22). git status follows a junction and lists
 // the files behind it, which is why every ancestor is resolved and not just the leaf.
 function installedDependencyCacheFile(worktree: string, entry: WorktreeStatusEntry): boolean {
-  if (entry.code !== '!!' || !dependencyCachePath(entry.path) || entry.path.endsWith('/')) return false;
-  const segments = entry.path.split(/[\\/]+/).filter(Boolean);
+  if (entry.code !== '!!' || !dependencyCachePath(entry.path)) return false;
+  return Boolean(ignoredEntryLeafInsideTree(worktree, entry.path)?.stats.isFile());
+}
+
+// null when a path component escapes the tree or cannot be read. `link` says the leaf itself was a
+// link, which deleting the tree removes without following.
+function ignoredEntryLeafInsideTree(worktree: string, relativePath: string): { stats: import('node:fs').Stats; link: boolean } | null {
+  const segments = relativePath.split(/[\\/]+/).filter(Boolean);
   const canonicalWorktree = canonicalPath(worktree);
   let current = worktree;
   try {
     for (let depth = 0; depth < segments.length; depth += 1) {
       current = path.join(current, segments[depth]!);
       let stats = nativeFs.lstatSync(current);
-      if (stats.isSymbolicLink()) {
+      const link = stats.isSymbolicLink();
+      if (link) {
         const resolved = linkTargetPath(current, nativeFs.readlinkSync(current));
-        if (!pathIsInside(canonicalWorktree, resolved)) return false;
+        if (!pathIsInside(canonicalWorktree, resolved)) return null;
         current = resolved;
         stats = nativeFs.lstatSync(current);
         // linkTargetPath resolves the whole chain, so a link left here is one the platform could
         // not resolve at all, such as a cycle.
-        if (stats.isSymbolicLink()) return false;
+        if (stats.isSymbolicLink()) return null;
       }
-      if (depth === segments.length - 1) return stats.isFile();
+      if (depth === segments.length - 1) return { stats, link };
     }
   } catch (_) {
-    return false;
+    return null;
   }
-  return false;
+  return null;
+}
+
+// A finished ticket's tree always holds ignored build output (.next, .env.local, test-results), and
+// counting it as data parked every one of them for three weeks (SQ-51). git lists each ignored file
+// on its own under --untracked-files=all and prints a directory only for a nested repository, so a
+// directory leaf is the SQ-2952 nested repository and stays data; so does anything reached through a
+// link that leaves the tree.
+function rebuildableIgnoredEntry(worktree: string, entry: WorktreeStatusEntry): boolean {
+  if (entry.code !== '!!') return false;
+  const leaf = ignoredEntryLeafInsideTree(worktree, entry.path);
+  return Boolean(leaf && (leaf.link || !leaf.stats.isDirectory()));
 }
 
 function atRiskStatusEntriesSync(worktree: string, ticketOrDispatch: any = null): WorktreeStatusEntry[] {
@@ -151,6 +169,7 @@ const DEFAULT_RECOVERY_RETENTION_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const WORKTREE_SWEEP_CLASSIFICATION_ORDER = Object.freeze([
   'status_unknown',
   'tracked_changes',
+  'ticket_closed_settled',
   'too_young',
   'upstream_ambiguous',
   'upstream_unavailable',
@@ -165,40 +184,67 @@ const WORKTREE_SWEEP_CLASSIFICATION_ORDER = Object.freeze([
   'not_integrated',
 ]);
 const QUARANTINE_RETRY_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// Every candidate's status used to start at once, so on 143 trees the ones scheduled last ran out
+// the shared 120 s cap and 53 of 56 status_unknown results were those (SQ-51).
+const SWEEP_CLASSIFICATION_CONCURRENCY = 4;
+const DEFAULT_STATUS_TIMEOUT_MS = 60_000;
+const GIT_TIMEOUT_MS = 120_000;
 
 interface GitResult {
   ok: boolean;
   status: number | null;
   stdout: string;
   stderr: string;
+  timedOut?: boolean;
 }
 
-function git(cwd: string, args: string[], input?: string, environment?: NodeJS.ProcessEnv): Promise<GitResult> {
+function git(cwd: string, args: string[], input?: string, environment?: NodeJS.ProcessEnv, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
   return new Promise((resolve) => {
     const child = spawn('git', ['-c', 'core.editor=true', ...args], {
       cwd,
       env: { ...process.env, GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true', ...environment },
-      timeout: 120_000,
       windowsHide: true,
       stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
     if (input != null) child.stdin.end(input);
     child.once('error', (error: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
       resolve({ ok: false, status: null, stdout: '', stderr: String(error.message || '').trim() });
     });
     child.once('close', (status: number | null) => {
+      clearTimeout(timer);
       resolve({
-        ok: status === 0,
+        ok: status === 0 && !timedOut,
         status,
         stdout: Buffer.concat(stdout).toString('utf8').trim(),
-        stderr: Buffer.concat(stderr).toString('utf8').trim(),
+        stderr: timedOut ? `git ${args[0]} timed out after ${timeoutMs}ms` : Buffer.concat(stderr).toString('utf8').trim(),
+        ...(timedOut ? { timedOut } : {}),
       });
     });
   });
+}
+
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, map: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await map(items[index]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
+  return results;
 }
 
 function pathIsInside(root: string, candidate: string): boolean {
@@ -667,8 +713,15 @@ async function resolvedIntegrationUpstream(repo: string, options: any): Promise<
   throw new Error('worktree sweep requires the board integration target.');
 }
 
+// `removed` is set only by the remove path's own ticket-close cleanup: a deleted ticket is otherwise
+// absent from the board and its tree reads as unowned.
 function finalTicket(ticket: any): boolean {
-  return Boolean(ticket && (ticket.archived || ticket.status === 'done'));
+  return Boolean(ticket && (ticket.archived || ticket.removed || ticket.status === 'done'));
+}
+
+function releasedTicket(ticket: any): boolean {
+  return Boolean(ticket && !liveClaimTicket(ticket) && ticket.dispatch?.outcome === 'released'
+    && dispatchHasTerminalLifecycleAuthority(ticket.dispatch));
 }
 
 // `done` is a board fact, not an agent fact. An integration closure marks the
@@ -781,8 +834,10 @@ async function worktreeAge(pathname: string): Promise<number | null> {
 type WorktreeSweepFacts = {
   clean: boolean;
   statusKnown: boolean;
+  statusTimedOut: boolean;
   trackedChanges: boolean;
   untrackedOrIgnored: boolean;
+  onlyRebuildableIgnored: boolean;
   ahead: number | null;
   reachable: boolean;
   patchEquivalent: boolean;
@@ -795,9 +850,9 @@ type WorktreeSweepFacts = {
   oldEnoughToSalvage: boolean;
 };
 
-async function inspectWorktree(entry: { worktree: string }, ticket: any, minAgeMs: number, upstream: string | null, notIntegratedSalvageAgeMs: number): Promise<WorktreeSweepFacts> {
+async function inspectWorktree(entry: { worktree: string }, ticket: any, minAgeMs: number, upstream: string | null, notIntegratedSalvageAgeMs: number, statusTimeoutMs = DEFAULT_STATUS_TIMEOUT_MS): Promise<WorktreeSweepFacts> {
   const [cleanResult, ageMs, patch, reachable] = await Promise.all([
-    git(entry.worktree, [...AT_RISK_STATUS_ARGUMENTS]),
+    git(entry.worktree, [...AT_RISK_STATUS_ARGUMENTS], undefined, undefined, statusTimeoutMs),
     worktreeAge(entry.worktree),
     upstream ? patchEquivalence(entry.worktree, 'HEAD', upstream) : Promise.resolve({ equivalent: false, ahead: null, equivalentCommits: 0, unmatchedCommits: null }),
     upstream ? reachableFrom(entry.worktree, 'HEAD', upstream) : Promise.resolve(false),
@@ -806,8 +861,10 @@ async function inspectWorktree(entry: { worktree: string }, ticket: any, minAgeM
   return {
     clean: cleanResult.ok && statusEntries.length === 0,
     statusKnown: cleanResult.ok,
+    statusTimedOut: Boolean(cleanResult.timedOut),
     trackedChanges: statusEntries.some((status) => !UNVERSIONED_STATUS_CODES.has(status.code)),
     untrackedOrIgnored: statusEntries.some((status) => UNVERSIONED_STATUS_CODES.has(status.code)),
+    onlyRebuildableIgnored: cleanResult.ok && statusEntries.every((status) => rebuildableIgnoredEntry(entry.worktree, status)),
     ahead: patch.ahead,
     reachable,
     patchEquivalent: patch.equivalent,
@@ -821,8 +878,8 @@ async function inspectWorktree(entry: { worktree: string }, ticket: any, minAgeM
   };
 }
 
-function factsForEntry(facts: WorktreeSweepFacts): Omit<WorktreeSweepFacts, 'statusKnown' | 'trackedChanges' | 'untrackedOrIgnored'> {
-  const { statusKnown: _statusKnown, trackedChanges: _trackedChanges, untrackedOrIgnored: _untrackedOrIgnored, ...entryFacts } = facts;
+function factsForEntry(facts: WorktreeSweepFacts): Omit<WorktreeSweepFacts, 'statusKnown' | 'trackedChanges' | 'untrackedOrIgnored' | 'onlyRebuildableIgnored'> {
+  const { statusKnown: _statusKnown, trackedChanges: _trackedChanges, untrackedOrIgnored: _untrackedOrIgnored, onlyRebuildableIgnored: _onlyRebuildableIgnored, ...entryFacts } = facts;
   return entryFacts;
 }
 
@@ -929,14 +986,33 @@ function classifiedWorktreeEntry(entry: ClassifiedWorktreeEntry, ticket: Classif
 function liveWorktreeKeepReason(entry: any, ticket: any, lease: any): string | null {
   if (entry.locked) return 'locked';
   if (lease.liveness.status === 'live') return 'live_session';
-  if (ticket && !finalTicket(ticket)) return 'active_ticket';
+  if (ticket && !finalTicket(ticket) && !releasedTicket(ticket)) return 'active_ticket';
   if (lease.identity.status === 'bound' && lease.phase !== 'terminal') return 'active_ticket';
   return null;
 }
 
-async function classifyWorktree(repo: string, tickets: any[], entry: any, currentPath: string, minAgeMs: number, upstream: string | null, upstreamSafetyReason: string | null, livePaths: string[] = [], notIntegratedSalvageAgeMs = DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS, registeredWorktrees: readonly string[] = []): Promise<any> {
+function closedTicketCandidate(tickets: any[], entry: any): boolean {
+  if (entry.orphanDirectory) return false;
   const ticket = ticketForWorktree(tickets, entry);
-  const facts = await inspectWorktree(entry, ticket, minAgeMs, upstream, notIntegratedSalvageAgeMs);
+  return Boolean(ticket && !liveClaimTicket(ticket) && (finalTicket(ticket) || releasedTicket(ticket)));
+}
+
+// The ticket answers first (SQ-51): its commit is safe once the integration branch or the board's
+// own pin holds it, or when nothing was committed past the dispatch base. A released ticket's tree
+// is the one a continuation resumes from, so its pin alone does not settle it.
+async function closedTicketHeadSettled(entry: any, ticket: any, facts: WorktreeSweepFacts): Promise<boolean> {
+  if (facts.reachable) return true;
+  const head = String(entry.head || '').trim();
+  const base = String(ticket?.dispatch?.baseCommit || '').trim();
+  if (head && base.length >= 7 && head.startsWith(base)) return true;
+  const ref = String(ticket?.ref || '').trim();
+  if (!head || !ref || !finalTicket(ticket)) return false;
+  return (await git(entry.worktree, ['merge-base', '--is-ancestor', head, `refs/sidequest/${ref}`])).ok;
+}
+
+async function classifyWorktree(repo: string, tickets: any[], entry: any, currentPath: string, minAgeMs: number, upstream: string | null, upstreamSafetyReason: string | null, livePaths: string[] = [], notIntegratedSalvageAgeMs = DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS, registeredWorktrees: readonly string[] = [], statusTimeoutMs = DEFAULT_STATUS_TIMEOUT_MS): Promise<any> {
+  const ticket = ticketForWorktree(tickets, entry);
+  const facts = await inspectWorktree(entry, ticket, minAgeMs, upstream, notIntegratedSalvageAgeMs, statusTimeoutMs);
   const worktreePath = canonicalPath(entry.worktree);
   const current = worktreePath === canonicalPath(currentPath);
   if (current) return classifiedWorktreeEntry(entry, ticket, facts, 'keep', 'current_worktree', true);
@@ -962,6 +1038,10 @@ async function classifyWorktree(repo: string, tickets: any[], entry: any, curren
   let reason = 'not_integrated';
   if (!facts.statusKnown) reason = 'status_unknown';
   else if (facts.trackedChanges) reason = 'tracked_changes';
+  else if ((finalTicket(ticket) || releasedTicket(ticket)) && facts.onlyRebuildableIgnored && await closedTicketHeadSettled(entry, ticket, facts)) {
+    action = 'remove';
+    reason = 'ticket_closed_settled';
+  } else if (releasedTicket(ticket)) reason = 'active_ticket';
   else if (!facts.oldEnough) reason = 'too_young';
   else if (upstreamSafetyReason) reason = upstreamSafetyReason;
   else if (facts.untrackedOrIgnored) {
@@ -969,7 +1049,7 @@ async function classifyWorktree(repo: string, tickets: any[], entry: any, curren
       action = 'quarantine';
       reason = 'untracked_quarantined';
     } else reason = 'untracked_recent';
-  } else if (ticket?.archived) {
+  } else if (ticket?.archived || ticket?.removed) {
     action = 'remove';
     reason = 'ticket_archived';
   } else if (ticket?.status === 'done') {
@@ -1513,9 +1593,13 @@ function dependencyLinkDisplayPath(root: string, pathname: string): string {
   return relative && relative !== '..' && !relative.startsWith('../') && !path.isAbsolute(relative) ? relative : pathname;
 }
 
-// Removal is the whole hazard: `fs.rm` and `git worktree remove` can follow a link that leaves the
-// tree and delete data the tree never owned, which is why a `node_modules` linked to a shared store
-// has to be released first. A link whose resolved target stays inside the tree can reach nothing but
+// Removal is the whole hazard, and it is a Windows hazard: on Linux and macOS `rm -rf` and `fs.rm`
+// unlink a symlink and never descend into it, but a Windows junction is followed by `git worktree
+// remove` and by older recursive deletes, and would delete data the tree never owned. That is why a
+// `node_modules` linked to a shared store has to be released first, and why a link that escapes the
+// tree still parks it on every platform. A link git tracks (mode 120000, such as a committed
+// `index.md -> INDEX.md`) is ordinary checkout content, and one git reports untracked and not ignored
+// already routes the tree to quarantine through the status read (SQ-51). A link whose resolved target stays inside the tree can reach nothing but
 // data that goes with the tree anyway, so it is removed with it like any other entry. Rejecting those
 // kept every done worktree on disk instead: every `node_modules/.bin` entry an executor's install
 // wrote is one, and no record names them (SQ-21).
@@ -1665,11 +1749,13 @@ async function lateContentInMovedWorktree(
   classifiedHead: string | null,
   recordedLinks: readonly string[],
   branch: string | null,
+  rebuildableIgnoredAllowed = false,
 ): Promise<{ blocked: string | null; head: string | null; branchTip: string | null }> {
   const blockedBy = (blocked: string) => ({ blocked, head: null, branchTip: null });
   const status = await git(destination, [...AT_RISK_STATUS_ARGUMENTS]);
   if (!status.ok) return blockedBy(`the moved tree could not be read again: ${status.stderr || `git status exited ${status.status}`}`);
-  const held = atRiskStatusEntries(status.stdout, destination, recordedLinks);
+  const held = atRiskStatusEntries(status.stdout, destination, recordedLinks)
+    .filter((entry) => !(rebuildableIgnoredAllowed && rebuildableIgnoredEntry(destination, entry)));
   if (held.length) return blockedBy(`the moved tree holds ${held.length} entries the classification did not see, starting with ${held[0]!.code} ${held[0]!.path}`);
   const head = await git(destination, ['rev-parse', 'HEAD']);
   if (!head.ok) return blockedBy(`the moved tree's HEAD could not be read again: ${head.stderr || `git rev-parse exited ${head.status}`}`);
@@ -2118,6 +2204,91 @@ function reportSweepProgress(options: SweepProgressOptions, entries: readonly Sw
   if (typeof options.onProgress === 'function') options.onProgress(sweepProgress(entries, removed, status));
 }
 
+const DEFAULT_WORKTREE_BUDGET_MAX_COUNT = 100;
+const DEFAULT_WORKTREE_BUDGET_MAX_BYTES = 200 * 1024 ** 3;
+const WORKTREE_BYTES_MEASURE_INTERVAL_MS = 60 * 60 * 1000;
+
+function worktreeBytesSnapshotFile(repository: string): string {
+  return path.join(sidequestHome(), 'worktree-budget', `${worktreeProjectSlug(canonicalPath(repository))}.json`);
+}
+
+function readWorktreeBytesSnapshot(repository: string): { bytes: number; measuredAt: string } | null {
+  try {
+    const snapshot = JSON.parse(nativeFs.readFileSync(worktreeBytesSnapshotFile(repository), 'utf8'));
+    return Number.isFinite(snapshot?.bytes) && Number.isFinite(Date.parse(snapshot?.measuredAt)) ? snapshot : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Walking every tree's node_modules takes minutes, which dispatch cannot spend, so the detached sweep
+// measures at most hourly and dispatch reads what it recorded.
+async function recordWorktreeBytes(repository: string): Promise<void> {
+  const previous = readWorktreeBytesSnapshot(repository);
+  if (previous && Date.now() - Date.parse(previous.measuredAt) < WORKTREE_BYTES_MEASURE_INTERVAL_MS) return;
+  try {
+    let bytes = 0;
+    for (const root of agentWorktreeRoots(repository)) bytes += await directoryBytes(root);
+    const file = worktreeBytesSnapshotFile(repository);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify({ bytes, measuredAt: new Date().toISOString() }));
+  } catch (_) {
+    // A missing measurement only means dispatch enforces the count half of the budget.
+  }
+}
+
+function agentWorktreeDirectories(repository: string): Array<{ path: string; ageMs: number }> {
+  const now = Date.now();
+  return agentWorktreeRoots(repository).flatMap((root) => {
+    try {
+      return nativeFs.readdirSync(root, { withFileTypes: true })
+        .filter((entry: import('node:fs').Dirent) => entry.isDirectory() && entry.name.startsWith('agent-'))
+        .map((entry: import('node:fs').Dirent) => {
+          const pathname = path.join(root, entry.name);
+          return { path: pathname, ageMs: Math.max(0, now - nativeFs.statSync(pathname).mtimeMs) };
+        });
+    } catch (_) {
+      return [];
+    }
+  });
+}
+
+function positiveLimit(value: unknown, fallback: number): number {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 1 ? Math.floor(number) : fallback;
+}
+
+function formatGigabytes(bytes: number): string {
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+}
+
+// A dispatch that adds one more tree to a directory already past its budget is refused and told which
+// trees the sweep can take, oldest first, instead of silently filling the disk (SQ-51).
+function worktreeBudgetRefusal(repository: string, tickets: any[], config: any = {}): string | null {
+  const maxCount = positiveLimit(config?.worktreeBudgetMaxCount, DEFAULT_WORKTREE_BUDGET_MAX_COUNT);
+  const maxBytes = positiveLimit(config?.worktreeBudgetMaxBytes, DEFAULT_WORKTREE_BUDGET_MAX_BYTES);
+  const trees = agentWorktreeDirectories(repository);
+  const snapshot = readWorktreeBytesSnapshot(repository);
+  const overCount = trees.length >= maxCount;
+  const overBytes = Boolean(snapshot && snapshot.bytes >= maxBytes);
+  if (!overCount && !overBytes) return null;
+  const usage = [
+    overCount ? `${trees.length} agent worktrees against a maximum of ${maxCount}` : '',
+    overBytes ? `${formatGigabytes(snapshot!.bytes)} measured ${snapshot!.measuredAt} against a maximum of ${formatGigabytes(maxBytes)}` : '',
+  ].filter(Boolean).join(' and ');
+  const oldestFirst = (left: { ageMs: number; path: string }, right: { ageMs: number; path: string }) => right.ageMs - left.ageMs || left.path.localeCompare(right.path);
+  const deletable = trees
+    .map((tree) => ({ ...tree, ticket: ticketForWorktree(tickets, { worktree: tree.path }) }))
+    .filter((tree) => closedTicketCandidate(tickets, { worktree: tree.path }))
+    .sort(oldestFirst)
+    .slice(0, 3)
+    .map((tree) => `${tree.path} (${tree.ticket.ref} ${tree.ticket.archived || tree.ticket.status === 'done' ? 'done' : 'released'}, ${Math.floor(tree.ageMs / 3_600_000)}h old)`);
+  const named = deletable.length
+    ? `Oldest deletable: ${deletable.join('; ')}.`
+    : `No tree belongs to a closed ticket yet; the oldest are ${[...trees].sort(oldestFirst).slice(0, 3).map((tree) => tree.path).join('; ')}.`;
+  return `worktree budget exceeded for ${repository}: ${usage}. ${named} Reclaim them with \`sidequest worktrees sweep --yes --project "${repository}"\`, or raise the budget with \`sidequest board-config --project "${repository}" --worktree-budget-max-count <n> --worktree-budget-max-bytes <bytes>\`.`;
+}
+
 async function sweep(repo: string, tickets: any[], options: any = {}): Promise<any> {
   const minAgeMs = Number.isFinite(Number(options.minAgeMs)) && Number(options.minAgeMs) >= 0
     ? Number(options.minAgeMs)
@@ -2143,6 +2314,7 @@ async function sweep(repo: string, tickets: any[], options: any = {}): Promise<a
       strayDirectories: [],
       retainedBranches: [],
       remainingCandidates: 0,
+      statusTimedOut: 0,
       orphanBranches: [],
       removed: [],
       salvaged: [],
@@ -2180,8 +2352,16 @@ async function sweep(repo: string, tickets: any[], options: any = {}): Promise<a
     : allCandidates.length;
   // Oldest first: a bounded run over hundreds of worktrees has to drain from the
   // back of the queue, or it re-examines the same young ones every session (SQ-2924).
-  const agedCandidates = await Promise.all(allCandidates.map(async (entry: any) => ({ entry, ageMs: (await worktreeAge(entry.worktree)) ?? 0 })));
-  agedCandidates.sort((left, right) => right.ageMs - left.ageMs || String(left.entry.worktree).localeCompare(String(right.entry.worktree)));
+  // Trees whose ticket already closed go ahead of the rest, or a bounded run keeps
+  // re-reading the same old unowned trees and never reaches a newly finished one (SQ-51).
+  const agedCandidates = await Promise.all(allCandidates.map(async (entry: any) => ({
+    entry,
+    ageMs: (await worktreeAge(entry.worktree)) ?? 0,
+    closed: closedTicketCandidate(tickets, entry),
+  })));
+  agedCandidates.sort((left, right) => Number(right.closed) - Number(left.closed)
+    || right.ageMs - left.ageMs
+    || String(left.entry.worktree).localeCompare(String(right.entry.worktree)));
   const boundedCandidates = agedCandidates.slice(0, maxCandidates).map((candidate) => candidate.entry);
   const remainingCandidates = agedCandidates.length - boundedCandidates.length;
   const livePaths = Array.isArray(options.livePaths) ? options.livePaths.map((pathname: unknown) => String(pathname)) : [];
@@ -2194,17 +2374,21 @@ async function sweep(repo: string, tickets: any[], options: any = {}): Promise<a
     current: entry.worktree,
     reason,
   });
-  const entries = await Promise.all(boundedCandidates.map(async (entry) => {
+  const statusTimeoutMs = Number.isFinite(Number(options.statusTimeoutMs)) && Number(options.statusTimeoutMs) > 0
+    ? Number(options.statusTimeoutMs)
+    : DEFAULT_STATUS_TIMEOUT_MS;
+  const entries = await mapWithConcurrency(boundedCandidates, SWEEP_CLASSIFICATION_CONCURRENCY, async (entry: any) => {
     reportSweepProgress(options, classified, removed, classificationStatus(entry, null));
     const classifiedEntry = entry.orphanDirectory
       ? await classifyOrphanDirectory(tickets, entry, livePaths, minAgeMs)
-      : await classifyWorktree(repo, tickets, entry, options.currentPath || process.cwd(), minAgeMs, comparison, upstreamSafetyReason, livePaths, notIntegratedSalvageAgeMs, [...registered]);
+      : await classifyWorktree(repo, tickets, entry, options.currentPath || process.cwd(), minAgeMs, comparison, upstreamSafetyReason, livePaths, notIntegratedSalvageAgeMs, [...registered], statusTimeoutMs);
     classifiedEntry.upstream = upstream;
     classifiedEntry.upstreamFallback = upstreamFallback;
     classified.push(classifiedEntry);
     reportSweepProgress(options, classified, removed, classificationStatus(entry, classifiedEntry.reason));
     return classifiedEntry;
-  }));
+  });
+  const statusTimedOut = entries.filter((entry: any) => entry.statusTimedOut).length;
   // Every branch this sweep could still delete, so a detached commit is never called safe on the
   // strength of one of them. Two passes delete branches: the compare-and-delete below, for entries the
   // classification found already upstream, and the orphan pass at the end. The orphan pass decides
@@ -2347,7 +2531,7 @@ async function sweep(repo: string, tickets: any[], options: any = {}): Promise<a
       }
       const classifiedReason = entry.reason;
       const branch = localBranchName(entry.branch);
-      const movedRead = await lateContentInMovedWorktree(destination, entry.head, recordedLinks, branch);
+      const movedRead = await lateContentInMovedWorktree(destination, entry.head, recordedLinks, branch, classifiedReason === 'ticket_closed_settled');
       if (movedRead.blocked) {
         await park('late_content_quarantined', `classified ${classifiedReason}, but ${movedRead.blocked}, so the moved tree was parked instead of deleted`);
         continue;
@@ -2429,6 +2613,7 @@ async function sweep(repo: string, tickets: any[], options: any = {}): Promise<a
   }
 
   const strayDirectories = options.ticketRef ? [] : await sweepStrayWorktreeHome(repo, execute, failures);
+  if (execute && !options.ticketRef) await recordWorktreeBytes(repo);
 
   reportSweepProgress(options, entries, removed, completeStatus);
   return {
@@ -2441,6 +2626,7 @@ async function sweep(repo: string, tickets: any[], options: any = {}): Promise<a
     strayDirectories,
     retainedBranches,
     remainingCandidates,
+    statusTimedOut,
     orphanBranches,
     removed,
     salvaged,
@@ -2457,10 +2643,11 @@ async function sweep(repo: string, tickets: any[], options: any = {}): Promise<a
       retainedBranches: retainedBranches.length,
       prunedOrphanBranches: prunedOrphanBranches.length,
       removedStrayDirectories: strayDirectories.filter((entry: any) => entry.action === 'remove').length,
+      statusTimedOut,
       ...recoveryCounts(recovery),
     },
     failures,
   };
 }
 
-module.exports = { WORKTREE_SWEEP_CLASSIFICATION_ORDER, retainedBranchExplanation, retainedWorktreeResumeDecision, DEFAULT_MIN_AGE_MS, DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS, DEFAULT_RECOVERY_RETENTION_AGE_MS, gitBashPath, canonicalPath, worktreeRoot, legacyWorktreeRoot, agentWorktreePath, agentWorktreeCandidates, agentIdFromWorktreePath, resolvedAgentWorktree, namedWorktreePath, agentWorktreeRoots, parseWorktreeList, isAgentWorktree, ignoredPathsMissingFromWorktree, dependencyLinkSafety, releaseQuarantinedDependencyLinks, provisionWorktree, preferredWorktreeIntegrationTarget, classifyWorktree, advanceIntegrationBranch, reclaimUnclaimedDispatchWorktree, quarantineCandidate, storageStatus, sweep };
+module.exports = { WORKTREE_SWEEP_CLASSIFICATION_ORDER, DEFAULT_WORKTREE_BUDGET_MAX_COUNT, DEFAULT_WORKTREE_BUDGET_MAX_BYTES, worktreeBudgetRefusal, retainedBranchExplanation, retainedWorktreeResumeDecision, DEFAULT_MIN_AGE_MS, DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_MS, DEFAULT_RECOVERY_RETENTION_AGE_MS, gitBashPath, canonicalPath, worktreeRoot, legacyWorktreeRoot, agentWorktreePath, agentWorktreeCandidates, agentIdFromWorktreePath, resolvedAgentWorktree, namedWorktreePath, agentWorktreeRoots, parseWorktreeList, isAgentWorktree, ignoredPathsMissingFromWorktree, dependencyLinkSafety, releaseQuarantinedDependencyLinks, provisionWorktree, preferredWorktreeIntegrationTarget, classifyWorktree, advanceIntegrationBranch, reclaimUnclaimedDispatchWorktree, quarantineCandidate, storageStatus, sweep };

@@ -253,6 +253,8 @@ async function cmdBoardConfig(opts: any) {
   if (opts['worktree-base'] != null) patch.worktreeBase = opts['worktree-base'];
   if (opts['not-integrated-salvage-age-hours'] != null) patch.notIntegratedSalvageAgeHours = opts['not-integrated-salvage-age-hours'];
   if (opts['worktree-recovery-retention-age-hours'] != null) patch.worktreeRecoveryRetentionAgeHours = opts['worktree-recovery-retention-age-hours'];
+  if (opts['worktree-budget-max-count'] != null) patch.worktreeBudgetMaxCount = opts['worktree-budget-max-count'];
+  if (opts['worktree-budget-max-bytes'] != null) patch.worktreeBudgetMaxBytes = opts['worktree-budget-max-bytes'];
   if (opts['auto-approve-test-scope'] !== undefined) patch.autoApproveTestScope = opts['auto-approve-test-scope'];
   if (opts['auto-approve-scope'] != null) patch.autoApproveScope = opts['auto-approve-scope'];
   if (opts['worktree-setup'] != null) patch.worktreeSetup = opts['worktree-setup'];
@@ -279,6 +281,7 @@ async function cmdBoardConfig(opts: any) {
   console.log(`worktree base: ${payload.worktreeBase}`);
   console.log(`unintegrated worktree salvage age: ${payload.notIntegratedSalvageAgeHours}h`);
   console.log(`worktree recovery retention: ${payload.worktreeRecoveryRetentionAgeHours}h`);
+  console.log(`worktree budget: ${payload.worktreeBudgetMaxCount} worktrees, ${payload.worktreeBudgetMaxBytes} bytes`);
   console.log(`test scope auto-approval: ${payload.autoApproveTestScope ? 'enabled' : 'disabled'}`);
   console.log(`configured scope auto-approval: ${payload.autoApproveScope.length ? payload.autoApproveScope.join(', ') : '(none)'}`);
   console.log(`worktree setup command: ${payload.worktreeSetup || '(none)'}`);

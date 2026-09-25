@@ -251,6 +251,24 @@ function compactSchema(schema, propertyMap = false) {
   return compact;
 }
 const LIST_RESULT_MAX_BYTES = MCP_TOOL_RESULT_PAYLOAD_MAX_BYTES;
+function claimHeldLive(ticket) {
+  return Boolean(ticket?.claim?.by && !store.claimReclaimable(ticket));
+}
+async function cleanupClosedTicketWorktree(slug, projectPath, ticket, claimWasLive = false, extraTicket = null) {
+  try {
+    const dispatch = ticket?.dispatch;
+    if (!dispatch?.worktree || dispatch.sharedTree !== false || dispatch.continuation || store.boardConfig(slug)?.worktreeIsolation === false) return;
+    const tickets = [...store.worktreeGcTickets(), ...extraTicket ? [extraTicket] : []].map((candidate) => candidate.ref === ticket.ref && claimWasLive ? { ...candidate, claimLive: true } : candidate);
+    await worktrees.sweep(projectPath, tickets, {
+      execute: true,
+      currentPath: store.nearestRepoRoot(process.cwd()),
+      integrationTarget: store.ticketIntegrationTarget(slug, ticket),
+      minAgeMs: 0,
+      ticketRef: ticket.ref
+    });
+  } catch (_) {
+  }
+}
 function closeDispatchExecutor(ticket) {
   const executor = store.canonicalPreparedDispatchExecutor(ticket);
   if (executor) agentsync.cleanupNativeAgents({ name: executor });
@@ -987,6 +1005,8 @@ module.exports = {
   compactSchema,
   LIST_RESULT_MAX_BYTES,
   closeDispatchExecutor,
+  claimHeldLive,
+  cleanupClosedTicketWorktree,
   mutationAck,
   integrationBranchAck,
   outOfScopeComment,

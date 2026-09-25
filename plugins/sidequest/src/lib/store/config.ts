@@ -2,6 +2,7 @@
 
 const DEFAULT_NOT_INTEGRATED_SALVAGE_AGE_HOURS = 7 * 24;
 const DEFAULT_WORKTREE_RECOVERY_RETENTION_AGE_HOURS = 14 * 24;
+const { DEFAULT_WORKTREE_BUDGET_MAX_COUNT, DEFAULT_WORKTREE_BUDGET_MAX_BYTES } = require('../worktrees.js');
 
 function createConfig({ DEFAULT_INTEGRATION_VERIFY_TIMEOUT_MS, DELIVERY_MODES, execFileSync, fs, getProjectCategories, integrationTargetRef, isTrackedBuildOutput, packageBuildOutputs, packageRootForScope, path, projectRoutingProfile, readMeta, routingProfileEntries, MAX_INTEGRATION_VERIFY_TIMEOUT_MS, WORKTREE_SETUP_MAX_LENGTH, withMetaLock, putProject }: any) {
 function defaultProjectName(absPath?: any) {
@@ -179,6 +180,13 @@ function normalizeNotIntegratedSalvageAgeHours(value?: any) {
   return hours;
 }
 
+function normalizeWorktreeBudgetLimit(name: string, fallback: number, value?: any) {
+  if (value == null || value === '') return fallback;
+  const limit = Number(value);
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error(`${name} must be a whole number of at least 1.`);
+  return limit;
+}
+
 function normalizeWorktreeRecoveryRetentionAgeHours(value?: any) {
   if (value == null || value === '') return DEFAULT_WORKTREE_RECOVERY_RETENTION_AGE_HOURS;
   const hours = Number(value);
@@ -333,6 +341,8 @@ function boardConfig(slug?: any) {
     worktreeBase: normalizeWorktreeBase(meta.worktreeBase),
     notIntegratedSalvageAgeHours: normalizeNotIntegratedSalvageAgeHours(meta.notIntegratedSalvageAgeHours),
     worktreeRecoveryRetentionAgeHours: normalizeWorktreeRecoveryRetentionAgeHours(meta.worktreeRecoveryRetentionAgeHours),
+    worktreeBudgetMaxCount: normalizeWorktreeBudgetLimit('worktreeBudgetMaxCount', DEFAULT_WORKTREE_BUDGET_MAX_COUNT, meta.worktreeBudgetMaxCount),
+    worktreeBudgetMaxBytes: normalizeWorktreeBudgetLimit('worktreeBudgetMaxBytes', DEFAULT_WORKTREE_BUDGET_MAX_BYTES, meta.worktreeBudgetMaxBytes),
     autoApproveTestScope: normalizeAutoApproveTestScope(meta.autoApproveTestScope == null ? meta.autoApprovePluginTests : meta.autoApproveTestScope),
     autoApproveScope: normalizeAutoApproveScope(meta.autoApproveScope),
     worktreeSetup: normalizeWorktreeSetup(meta.worktreeSetup),
@@ -393,6 +403,9 @@ function setBoardConfig(slug?: any, patch?: any) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'worktreeRecoveryRetentionAgeHours')) {
       meta.worktreeRecoveryRetentionAgeHours = normalizeWorktreeRecoveryRetentionAgeHours(patch.worktreeRecoveryRetentionAgeHours);
+    }
+    for (const [key, fallback] of [['worktreeBudgetMaxCount', DEFAULT_WORKTREE_BUDGET_MAX_COUNT], ['worktreeBudgetMaxBytes', DEFAULT_WORKTREE_BUDGET_MAX_BYTES]] as const) {
+      if (Object.prototype.hasOwnProperty.call(patch, key)) meta[key] = normalizeWorktreeBudgetLimit(key, fallback, patch[key]);
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'autoApproveTestScope')) {
       meta.autoApproveTestScope = normalizeAutoApproveTestScope(patch.autoApproveTestScope);

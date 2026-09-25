@@ -59,6 +59,8 @@ const {
   verifyEmbedsWorktreeRoot,
   withoutCategories,
   snapshotContextRetrieval,
+  cleanupClosedTicketWorktree,
+  claimHeldLive,
 } = require('./mcp-shared');
 
 function sameBasenameSiblingDetails(project: string, ticket: any, projectPath: string, tool: string) {
@@ -384,7 +386,9 @@ const tools: ToolDefinition[] = [
       if (!store.deleteTicket(slug, ticket.id, { allowLiveClaimDeletion: args.force === true })) {
         throw new Error(`remove: could not delete "${ticket.ref}" from ${meta.name}.`);
       }
-      return { ok: true, ref };
+      // Refusals above stay synchronous throws; only the deleted ticket's tree cleanup is awaited.
+      return cleanupClosedTicketWorktree(slug, meta.path, ticket, claimHeldLive(ticket), { ...ticket, removed: true, claimLive: false })
+        .then(() => ({ ok: true, ref }));
     },
   },
   {
