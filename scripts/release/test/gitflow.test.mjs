@@ -546,7 +546,7 @@ test('the entry proof refuses anything it cannot read as the same ordinary file'
 test('CI covers develop pushes and every pull request behind one aggregate job', () => {
   const workflow = readFileSync(new URL('../../../.github/workflows/test.yml', import.meta.url), 'utf8');
 
-  assert.match(workflow, /^ {4}branches: \[main, develop\]$/m);
+  assert.match(workflow, /^ {4}branches: \[main, develop, live\]$/m);
   assert.match(workflow, /^ {2}pull_request:$/m);
   assert.match(workflow, /^ {2}test-complete:$/m);
   assert.match(workflow, /needs: \[release-engine, plugin-matrix, affected-plugin\]/);
