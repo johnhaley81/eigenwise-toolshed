@@ -14,7 +14,7 @@ const {
   reportLoadedPluginVersion,
   reportedLoadedPluginVersion,
 } = require('./freshness-helpers.js');
-const { cacheIsCurrent, readCache } = require('./marketplace-freshness-cache.js');
+const { cacheIsCurrent, forkLabel, readCache } = require('./marketplace-freshness-cache.js');
 
 const MARKETPLACE = 'eigenwise-toolshed';
 const warnedStates = new Set();
@@ -131,6 +131,22 @@ function remoteWarning(instances, cache, now) {
   return `Toolshed updates available: ${updates.map((update) => `${update.name} ${update.installed} → ${update.available}`).join(', ')}. Run /update-toolshed to install them; /reload-plugins cannot fetch new versions.`;
 }
 
+function syncWarning(cache, now) {
+  if (!cacheIsCurrent(cache, now) || compareSemver(cache.sync?.base?.marketplaceVersion, cache.sync?.upstreamVersion) !== -1) return '';
+  return `Toolshed fork sync due: Eigenwise released Toolshed ${cache.sync.upstreamVersion}, and this machine installs from the fork ${forkLabel(cache.url)}, which is based on ${cache.sync.base.marketplaceVersion}. Do not run /update-toolshed for this. Sync the fork from the eigenwise-toolshed checkout: merge upstream main into live, run the suites, then follow scripts/fork/README.md. In other projects, mention this to John and continue.`;
+}
+
+function remoteOutput(instances, cache, input, options, now) {
+  const remoteMessage = remoteWarning(instances, cache, now);
+  const updates = remoteUpdates(instances, cache?.manifest);
+  return remoteMessage && warnOnce(input, 'remote', options, availableVersionsKey(updates)) ? warningOutput(remoteMessage) : '';
+}
+
+function syncOutput(cache, input, options, now) {
+  const message = syncWarning(cache, now);
+  return message && warnOnce(input, 'sync', options, cache.sync.upstreamVersion) ? warningOutput(message) : '';
+}
+
 function decide(input, options = {}) {
   const fileSystem = options.fileSystem || fs;
   const pluginRoot = options.pluginRoot || process.env.CLAUDE_PLUGIN_ROOT;
@@ -145,9 +161,9 @@ function decide(input, options = {}) {
   const registryFile = options.registryFile || path.join(home, '.claude', 'plugins', 'installed_plugins.json');
   const instances = activeInstances(readJson(fileSystem, registryFile) || {}, input?.cwd, MARKETPLACE, options.platform);
   const cache = options.cache === undefined ? readCache(fileSystem, home) : options.cache;
-  const remoteMessage = remoteWarning(instances, cache, options.now ?? Date.now());
-  const updates = remoteUpdates(instances, cache?.manifest);
-  if (remoteMessage && warnOnce(input, 'remote', options, availableVersionsKey(updates))) return warningOutput(remoteMessage);
+  const now = options.now ?? Date.now();
+  const output = remoteOutput(instances, cache, input, options, now) || syncOutput(cache, input, options, now);
+  if (output) return output;
   const installedVersion = newerInstalledVersion(instances, loadedVersion);
   if (installedVersion) return warnOnce(input, 'reload', options, `quartermaster@${installedVersion}`) ? warningOutput(reloadWarning(installedVersion, loadedVersion)) : '';
   const reportedUpdates = reportedReloads(instances, input, options);
@@ -183,5 +199,6 @@ module.exports = {
   remoteWarning,
   reportedReloads,
   reportedReloadWarning,
+  syncWarning,
   warnOnce,
 };

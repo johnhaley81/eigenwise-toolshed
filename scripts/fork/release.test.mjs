@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
+import { marketplaceJson } from '../release/test/helpers.mjs';
 import { makeGitRepo } from '../release/test/realrepo.mjs';
 import { formatTable, parseOptions, planRelease, run, versionChanges } from './release.mjs';
 
@@ -16,6 +17,20 @@ function setup(t) {
 
 function readVersion(repo, relative) {
   return JSON.parse(readFileSync(path.join(repo.root, relative), 'utf8')).version;
+}
+
+function readForkBase(repo) {
+  return JSON.parse(readFileSync(path.join(repo.root, '.claude-plugin/fork-base.json'), 'utf8'));
+}
+
+// An upstream minor release the fork has not merged: only the upstream ref moves, so the fork's own plugin edits still differ from it.
+function moveUpstreamToMinor(repo) {
+  repo.git('checkout', '-q', '-b', 'upstream-minor', 'upstream/main');
+  repo.write('.claude-plugin/marketplace.json', marketplaceJson({ version: '3.11.0', plugins: { alpha: '1.3.0', beta: '0.4.0' } }));
+  repo.write('plugins/alpha/.claude-plugin/plugin.json', `${JSON.stringify({ name: 'alpha', version: '1.3.0', license: 'MIT' }, null, 2)}\n`);
+  repo.commit('upstream minor release');
+  repo.git('update-ref', 'refs/remotes/upstream/main', 'HEAD');
+  repo.git('checkout', '-q', 'main');
 }
 
 function execute(repo, argv, options = {}) {
@@ -82,14 +97,63 @@ test('after the tag, an unchanged plugin keeps its number and a changed one move
   assert.equal(readVersion(repo, '.claude-plugin/marketplace.json'), '3.10.1001');
 });
 
-test('write with nothing to move makes no commit', (t) => {
+test('write with nothing to move and the base recorded makes no commit', (t) => {
   const repo = setup(t);
+  execute(repo, ['--write']);
   const head = repo.git('rev-parse', 'HEAD');
 
   const output = execute(repo, ['--write']);
 
   assert.match(output, /Nothing moved/);
   assert.equal(repo.git('rev-parse', 'HEAD'), head);
+});
+
+test('write records the upstream marketplace version in fork-base.json inside the release commit', (t) => {
+  const repo = setup(t);
+  repo.write('plugins/alpha/index.js', '// forked\n');
+  repo.commit('fork change');
+
+  execute(repo, ['--write']);
+
+  assert.deepEqual(readForkBase(repo), { upstream: { repo: 'Eigenwise/eigenwise-toolshed', ref: 'main' }, marketplaceVersion: '3.10.0' });
+  assert.match(repo.git('show', '--name-only', '--format=', 'HEAD'), /^\.claude-plugin\/fork-base\.json$/m);
+  assert.equal(repo.git('status', '--porcelain'), '');
+});
+
+test('a dry run prints the base it would record and writes no file', (t) => {
+  const repo = setup(t);
+  repo.write('plugins/alpha/index.js', '// forked\n');
+  repo.commit('fork change');
+
+  const output = execute(repo, ['--dry-run']);
+
+  assert.match(output, /Would record \.claude-plugin\/fork-base\.json: \{"upstream":\{"repo":"Eigenwise\/eigenwise-toolshed","ref":"main"\},"marketplaceVersion":"3\.10\.0"\}/);
+  assert.equal(repo.git('status', '--porcelain'), '');
+});
+
+test('a second release after an upstream minor move records the new upstream version', (t) => {
+  const repo = setup(t);
+  repo.write('plugins/alpha/index.js', '// forked\n');
+  repo.commit('fork change');
+  execute(repo, ['--write']);
+  repo.git('tag', '-a', 'fork-v3.10.1000', '-m', 'fork release');
+  moveUpstreamToMinor(repo);
+
+  execute(repo, ['--write']);
+
+  assert.equal(readForkBase(repo).marketplaceVersion, '3.11.0');
+  assert.equal(readVersion(repo, '.claude-plugin/marketplace.json'), '3.11.1000');
+  assert.equal(repo.git('log', '-1', '--format=%s'), 'fork release fork-v3.11.1000');
+});
+
+test('a changed base with no plugin moving is committed as a base-only commit that says there is nothing to tag', (t) => {
+  const repo = setup(t);
+
+  const output = execute(repo, ['--write']);
+
+  assert.equal(repo.git('log', '-1', '--format=%s'), 'fork base 3.10.0');
+  assert.match(output, /nothing to tag/);
+  assert.equal(readVersion(repo, '.claude-plugin/marketplace.json'), '3.10.0');
 });
 
 test('a plugin upstream fully absorbed goes back to upstream number', (t) => {

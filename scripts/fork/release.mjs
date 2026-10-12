@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Fork-only. Numbers a release of the `live` branch so it never collides with upstream's versions.
 // It never tags, pushes, or touches release fragments, so `live` keeps merging cleanly with upstream.
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -12,6 +13,8 @@ import { nextForkVersion, nextMarketplaceVersion } from './version-rule.mjs';
 
 export const DEFAULT_UPSTREAM = 'upstream/main';
 export const UPSTREAM_URL = 'https://github.com/Eigenwise/eigenwise-toolshed.git';
+export const FORK_BASE_PATH = '.claude-plugin/fork-base.json';
+const UPSTREAM_SOURCE = { repo: 'Eigenwise/eigenwise-toolshed', ref: 'main' };
 const TEMP_UPSTREAM_REF = 'refs/fork-release/upstream';
 const HEADER = ['plugin', 'upstream', 'current', 'next', 'reason'];
 
@@ -98,12 +101,29 @@ function loadPlan(git, cwd, upstreamRef, upstreamUrl) {
   return { current, plan: planRelease({ upstream, current, facts: gitFacts(git, upstreamSha, lastForkTag(git)) }) };
 }
 
+// The quartermaster hooks compare this against Eigenwise's marketplace version to say when the fork needs a sync.
+export function forkBase(plan) {
+  return { upstream: UPSTREAM_SOURCE, marketplaceVersion: plan.marketplace.upstream };
+}
+
+function writeForkBase(cwd, plan) {
+  const file = path.join(cwd, FORK_BASE_PATH);
+  const text = `${JSON.stringify(forkBase(plan), null, 2)}\n`;
+  if (existsSync(file) && readFileSync(file, 'utf8') === text) return [];
+  writeFileSync(file, text);
+  return [FORK_BASE_PATH];
+}
+
+// A base-only commit still happens when no plugin moved, otherwise a sync that changes no number would leave the reminder firing forever.
 function writeRelease(git, cwd, current, plan, out) {
   const changes = versionChanges(plan);
-  if (changes.plugins.length === 0) return out('Nothing moved; no commit made.');
-  git.add(applyVersions(cwd, current, changes));
-  git.commit(`fork release fork-v${plan.marketplace.next}`);
-  return out(`Committed fork release fork-v${plan.marketplace.next}. Tag and push it yourself.`);
+  const base = writeForkBase(cwd, plan);
+  if (changes.plugins.length === 0 && base.length === 0) return out('Nothing moved; no commit made.');
+  git.add([...applyVersions(cwd, current, changes), ...base]);
+  const released = changes.plugins.length > 0;
+  const subject = released ? `fork release fork-v${plan.marketplace.next}` : `fork base ${plan.marketplace.upstream}`;
+  git.commit(subject);
+  return out(released ? `Committed ${subject}. Tag and push it yourself.` : `Committed ${subject}. No version moved, so there is nothing to tag.`);
 }
 
 export function parseOptions(argv) {
@@ -128,6 +148,7 @@ export function run(argv, { cwd = process.cwd(), out = console.log, upstreamUrl 
   const { current, plan } = loadPlan(git, root, options.upstream, upstreamUrl);
   out(formatTable(plan));
   if (options.write) writeRelease(git, root, current, plan, out);
+  else out(`Would record ${FORK_BASE_PATH}: ${JSON.stringify(forkBase(plan))}`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

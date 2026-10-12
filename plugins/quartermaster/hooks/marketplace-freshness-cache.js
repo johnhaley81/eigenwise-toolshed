@@ -5,12 +5,15 @@ const fs = require('node:fs');
 const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
-const { readJson } = require('./freshness-helpers.js');
+const { parseSemver, readJson } = require('./freshness-helpers.js');
 
 const CACHE_MAX_AGE_MS = 60 * 60 * 1000;
 const MARKETPLACE_NAME = 'eigenwise-toolshed';
 const GITHUB_REPOSITORY_URL = /^(?:https:\/\/|git@)github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?\/?$/;
 const REQUEST_TIMEOUT_MS = 5_000;
+const REPOSITORY_NAME = /^[\w.-]+\/[\w.-]+$/;
+const REF_NAME = /^[\w./-]+$/;
+const MANIFEST_URL_PARTS = /^https:\/\/raw\.githubusercontent\.com\/([^/]+\/[^/]+)\/(.+)\/\.claude-plugin\/marketplace\.json$/;
 
 function rawManifestUrl(repository, ref) {
   return `https://raw.githubusercontent.com/${repository}/${ref || 'main'}/.claude-plugin/marketplace.json`;
@@ -53,7 +56,7 @@ function cacheIsCurrent(cache, now = Date.now()) {
   return Number.isFinite(checkedAt) && now - checkedAt >= 0 && now - checkedAt < CACHE_MAX_AGE_MS;
 }
 
-function requestManifest(request = https.get, timeoutMs = REQUEST_TIMEOUT_MS, url = manifestUrl()) {
+function requestJson(request = https.get, timeoutMs = REQUEST_TIMEOUT_MS, url, validate) {
   return new Promise((resolve, reject) => {
     const response = request(url, { headers: { accept: 'application/json' } }, (incoming) => {
       let body = '';
@@ -65,9 +68,9 @@ function requestManifest(request = https.get, timeoutMs = REQUEST_TIMEOUT_MS, ur
           return;
         }
         try {
-          const manifest = JSON.parse(body);
-          if (!Array.isArray(manifest.plugins)) throw new Error('plugins array missing');
-          resolve(manifest);
+          const parsed = JSON.parse(body);
+          validate(parsed);
+          resolve(parsed);
         } catch (error) {
           reject(error);
         }
@@ -76,6 +79,45 @@ function requestManifest(request = https.get, timeoutMs = REQUEST_TIMEOUT_MS, ur
     response.setTimeout(timeoutMs, () => response.destroy(new Error('request timed out')));
     response.on('error', reject);
   });
+}
+
+function assertManifest(manifest) {
+  if (!Array.isArray(manifest.plugins)) throw new Error('plugins array missing');
+}
+
+function matches(pattern, value) {
+  return typeof value === 'string' && pattern.test(value);
+}
+
+// repo and ref become URL path segments, so a file the fork controls must not smuggle anything else in.
+function assertForkBase(base) {
+  const { repo, ref } = base.upstream;
+  if (!matches(REPOSITORY_NAME, repo) || !matches(REF_NAME, ref) || !parseSemver(base.marketplaceVersion)) throw new Error('fork base is invalid');
+}
+
+function requestManifest(request = https.get, timeoutMs = REQUEST_TIMEOUT_MS, url = manifestUrl()) {
+  return requestJson(request, timeoutMs, url, assertManifest);
+}
+
+function forkBaseUrl(url) {
+  return url.replace(/marketplace\.json$/, 'fork-base.json');
+}
+
+// A fork without a readable base file, or with an unreachable upstream, has nothing to compare, and that must stay silent.
+async function fetchSyncEntry(url, request, timeoutMs) {
+  if (url === MARKETPLACE_URL) return {};
+  try {
+    const base = await requestJson(request, timeoutMs, forkBaseUrl(url), assertForkBase);
+    const upstream = await requestManifest(request, timeoutMs, rawManifestUrl(base.upstream.repo, base.upstream.ref));
+    return { sync: { base, upstreamVersion: upstream.version } };
+  } catch (_) {
+    return {};
+  }
+}
+
+function forkLabel(url) {
+  const [, repository, ref] = MANIFEST_URL_PARTS.exec(url) || [];
+  return `${repository} (${ref})`;
 }
 
 function writeCache(cache, fileSystem = fs, home = os.homedir()) {
@@ -100,8 +142,11 @@ async function refreshCache(options = {}) {
   const existing = readCache(options.fileSystem, options.home, url);
   if (cacheIsCurrent(existing, now)) return existing;
   try {
-    const manifest = await (options.requestManifest || requestManifest)(options.request, undefined, url);
-    const cache = { checkedAt: new Date(now).toISOString(), url, manifest };
+    const [manifest, syncEntry] = await Promise.all([
+      (options.requestManifest || requestManifest)(options.request, undefined, url),
+      fetchSyncEntry(url, options.request),
+    ]);
+    const cache = { checkedAt: new Date(now).toISOString(), url, manifest, ...syncEntry };
     writeCache(cache, options.fileSystem, options.home);
     return cache;
   } catch (_) {
@@ -112,7 +157,7 @@ async function refreshCache(options = {}) {
 }
 
 async function main() {
-  process.stdout.write(`${JSON.stringify({ async: true, asyncTimeout: REQUEST_TIMEOUT_MS + 1_000 })}\n`);
+  process.stdout.write(`${JSON.stringify({ async: true, asyncTimeout: 2 * REQUEST_TIMEOUT_MS + 1_000 })}\n`);
   await refreshCache();
 }
 
@@ -124,6 +169,8 @@ module.exports = {
   REQUEST_TIMEOUT_MS,
   cacheFile,
   cacheIsCurrent,
+  fetchSyncEntry,
+  forkLabel,
   manifestUrl,
   readCache,
   refreshCache,

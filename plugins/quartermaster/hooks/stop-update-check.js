@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   cacheIsCurrent,
+  fetchSyncEntry,
   manifestUrl,
   readCache,
   requestManifest,
@@ -23,6 +24,7 @@ const {
   reloadWarning,
   reportedReloads,
   reportedReloadWarning,
+  syncWarning,
   warnOnce,
 } = require('./user-prompt-freshness.js');
 const { readJson, reportLoadedPluginVersion } = require('./freshness-helpers.js');
@@ -50,6 +52,10 @@ function refreshManifest(options, url) {
   return requestManifest(options.request, options.requestTimeoutMs ?? REFRESH_TIMEOUT_MS, url);
 }
 
+function refreshSync(options, url) {
+  return fetchSyncEntry(url, options.request, options.requestTimeoutMs ?? REFRESH_TIMEOUT_MS);
+}
+
 function environmentOf(options) {
   return options.environment || process.env;
 }
@@ -60,7 +66,8 @@ function isSkipped(input, options) {
 
 async function refreshedCache(options, now, fileSystem, home, url) {
   try {
-    const refreshed = { checkedAt: new Date(now).toISOString(), url, manifest: await refreshManifest(options, url) };
+    const [manifest, syncEntry] = await Promise.all([refreshManifest(options, url), refreshSync(options, url)]);
+    const refreshed = { checkedAt: new Date(now).toISOString(), url, manifest, ...syncEntry };
     writeCache(refreshed, fileSystem, home);
     return refreshed;
   } catch {
@@ -80,6 +87,11 @@ function remoteMessages(instances, cache, input, options, now) {
   const updates = remoteUpdates(instances, cache?.manifest);
   const warn = updates.length && warnOnce(input, 'stop-remote', options, availableVersionsKey(updates));
   return warn ? [remoteWarning(instances, cache, now)] : [];
+}
+
+function syncMessages(cache, input, options, now) {
+  const message = syncWarning(cache, now);
+  return message && warnOnce(input, 'stop-sync', options, cache.sync.upstreamVersion) ? [message] : [];
 }
 
 function reportedReloadMessages(instances, input, options) {
@@ -113,6 +125,7 @@ async function decide(input, options = {}) {
   const instances = activeToolshedInstances(input, options);
   const messages = [
     ...remoteMessages(instances, cache, input, options, now),
+    ...syncMessages(cache, input, options, now),
     ...reloadMessages(instances, input, options),
   ];
   return messages.length ? JSON.stringify({ systemMessage: messages.join('\n') }) : '';

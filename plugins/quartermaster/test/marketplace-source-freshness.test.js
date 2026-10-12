@@ -17,6 +17,7 @@ const { decide: decideUserPrompt } = require('../hooks/user-prompt-freshness.js'
 const { decide: decideStop } = require('../hooks/stop-update-check.js');
 
 const FORK_URL = 'https://raw.githubusercontent.com/johnhaley81/eigenwise-toolshed/live/.claude-plugin/marketplace.json';
+const FORK_BASE_URL = FORK_URL.replace('marketplace.json', 'fork-base.json');
 const NOW = 1_000_000;
 
 function tempHome(testContext) {
@@ -49,11 +50,28 @@ function manifestWith(version) {
   return { plugins: [{ name: 'sidequest', version }] };
 }
 
+function upstreamAt(version) {
+  return { version, plugins: [] };
+}
+
+function forkBase(marketplaceVersion, upstream = { repo: 'Eigenwise/eigenwise-toolshed', ref: 'main' }) {
+  return { upstream, marketplaceVersion };
+}
+
+// Fork 5.9.1000 is installed and the fork manifest is unchanged, so only the sync check can speak.
+function syncScenario(testContext, answers, failing) {
+  const home = tempHome(testContext);
+  registerFork(home);
+  installSidequest(home);
+  return { home, ...stubRequest({ [FORK_URL]: manifestWith('5.9.1000'), ...answers }, failing) };
+}
+
 // Stands in for https.get: answers only the URLs it was given and records every URL asked for.
-function stubRequest(manifests) {
+function stubRequest(manifests, failing = []) {
   const requested = [];
   const request = (url, _options, onResponse) => {
     requested.push(url);
+    if (failing.includes(url)) return { setTimeout: () => {}, on: (_event, onError) => setImmediate(() => onError(new Error('offline'))), destroy: () => {} };
     const incoming = new EventEmitter();
     incoming.setEncoding = () => {};
     incoming.statusCode = manifests[url] ? 200 : 404;
@@ -85,7 +103,7 @@ async function stopMessage(home, request) {
 
 async function promptMessage(home, request) {
   await refreshCache({ home, now: NOW, request });
-  const output = decideUserPrompt({ cwd: home, prompt: 'carry on' }, hookOptions(home));
+  const output = decideUserPrompt({ cwd: home, prompt: 'carry on', session_id: 'source-session' }, hookOptions(home));
   return output ? JSON.parse(output).hookSpecificOutput.additionalContext : '';
 }
 
@@ -143,7 +161,7 @@ test('refetches immediately after the marketplace is repointed and records the n
   await refreshCache({ home, now: NOW, request });
   registerFork(home);
   const cache = await refreshCache({ home, now: NOW + 1, request });
-  assert.deepEqual(requested, [MARKETPLACE_URL, FORK_URL]);
+  assert.deepEqual(requested, [MARKETPLACE_URL, FORK_URL, FORK_BASE_URL]);
   assert.equal(cache.url, FORK_URL);
   assert.deepEqual(cache.manifest, manifestWith('5.9.1001'));
 });
@@ -164,15 +182,84 @@ test('a fork release raises the prompt reminder from the fork manifest', async (
   assert.match(await promptMessage(home, request), /sidequest 5\.9\.1000 → 5\.9\.1001/);
 });
 
-test('an upstream release above an unchanged fork stays silent and never asks upstream', async (testContext) => {
-  const home = tempHome(testContext);
-  registerFork(home);
-  installSidequest(home);
-  const { request, requested } = stubRequest({ [FORK_URL]: manifestWith('5.9.1000'), [MARKETPLACE_URL]: manifestWith('5.10.0') });
-  assert.equal(await stopMessage(home, request), '');
+const SYNC_TEXT = /^Toolshed fork sync due: Eigenwise released Toolshed 3\.595\.0, and this machine installs from the fork johnhaley81\/eigenwise-toolshed \(live\), which is based on 3\.594\.0\. Do not run \/update-toolshed for this\./;
+
+function resetCache(home) {
   fs.rmSync(path.join(home, '.claude', 'eigenwise-toolshed'), { recursive: true });
+}
+
+test('an upstream release above the fork base shows the sync reminder, never the update reminder', async (testContext) => {
+  const { home, request, requested } = syncScenario(testContext, { [FORK_BASE_URL]: forkBase('3.594.0'), [MARKETPLACE_URL]: upstreamAt('3.595.0') });
+  const stop = await stopMessage(home, request);
+  assert.match(stop, SYNC_TEXT);
+  assert.doesNotMatch(stop, /Toolshed updates available/);
+  resetCache(home);
+  assert.match(await promptMessage(home, request), SYNC_TEXT);
+  assert.deepEqual(requested, [FORK_URL, FORK_BASE_URL, MARKETPLACE_URL, FORK_URL, FORK_BASE_URL, MARKETPLACE_URL]);
+});
+
+test('the sync reminder appears once per upstream version in a session', async (testContext) => {
+  const { home, request } = syncScenario(testContext, { [FORK_BASE_URL]: forkBase('3.594.0'), [MARKETPLACE_URL]: upstreamAt('3.595.0') });
+  assert.match(await stopMessage(home, request), SYNC_TEXT);
+  assert.equal(await stopMessage(home, request), '');
+  assert.match(await promptMessage(home, request), SYNC_TEXT);
   assert.equal(await promptMessage(home, request), '');
-  assert.deepEqual(requested, [FORK_URL, FORK_URL]);
+});
+
+test('an upstream release equal to the fork base stays silent', async (testContext) => {
+  const { home, request } = syncScenario(testContext, { [FORK_BASE_URL]: forkBase('3.594.0'), [MARKETPLACE_URL]: upstreamAt('3.594.0') });
+  assert.equal(await stopMessage(home, request), '');
+  assert.equal(await promptMessage(home, request), '');
+});
+
+test('an upstream patch release above the fork base shows the sync reminder', async (testContext) => {
+  const { home, request } = syncScenario(testContext, { [FORK_BASE_URL]: forkBase('3.594.0'), [MARKETPLACE_URL]: upstreamAt('3.594.1') });
+  assert.match(await stopMessage(home, request), /released Toolshed 3\.594\.1, .* based on 3\.594\.0\./);
+});
+
+test('a fork without a base file stays silent and never asks upstream', async (testContext) => {
+  const { home, request, requested } = syncScenario(testContext, { [MARKETPLACE_URL]: upstreamAt('3.595.0') });
+  assert.equal(await stopMessage(home, request), '');
+  resetCache(home);
+  assert.equal(await promptMessage(home, request), '');
+  assert.deepEqual(requested, [FORK_URL, FORK_BASE_URL, FORK_URL, FORK_BASE_URL]);
+});
+
+test('an unreachable upstream stays silent and is not reported as undetermined freshness', async (testContext) => {
+  const { home, request } = syncScenario(testContext, { [FORK_BASE_URL]: forkBase('3.594.0') }, [MARKETPLACE_URL]);
+  assert.equal(await stopMessage(home, request), '');
+  resetCache(home);
+  assert.equal(await promptMessage(home, request), '');
+});
+
+test('a base file that names an unsafe upstream or no version is ignored', async (testContext) => {
+  const unsafe = forkBase('3.594.0', { repo: '../../evil', ref: 'main' });
+  const { home, request, requested } = syncScenario(testContext, { [FORK_BASE_URL]: unsafe, [MARKETPLACE_URL]: upstreamAt('3.595.0') });
+  assert.equal(await stopMessage(home, request), '');
+  resetCache(home);
+  const { request: unversioned } = stubRequest({ [FORK_URL]: manifestWith('5.9.1000'), [FORK_BASE_URL]: forkBase('later'), [MARKETPLACE_URL]: upstreamAt('3.595.0') });
+  assert.equal(await stopMessage(home, unversioned), '');
+  assert.deepEqual(requested, [FORK_URL, FORK_BASE_URL]);
+});
+
+test('a base file that is not an object is ignored', async (testContext) => {
+  const { home, request, requested } = syncScenario(testContext, { [FORK_BASE_URL]: 'not a base', [MARKETPLACE_URL]: upstreamAt('3.595.0') });
+  assert.equal(await stopMessage(home, request), '');
+  assert.deepEqual(requested, [FORK_URL, FORK_BASE_URL]);
+});
+
+test('a fork release still raises the update reminder next to a quiet sync check', async (testContext) => {
+  const { home, request } = syncScenario(testContext, { [FORK_URL]: manifestWith('5.9.1001'), [FORK_BASE_URL]: forkBase('3.594.0'), [MARKETPLACE_URL]: upstreamAt('3.594.0') });
+  const message = await stopMessage(home, request);
+  assert.match(message, /sidequest 5\.9\.1000 → 5\.9\.1001/);
+  assert.doesNotMatch(message, /fork sync due/);
+});
+
+test('a fork release and a due sync both report on Stop', async (testContext) => {
+  const { home, request } = syncScenario(testContext, { [FORK_URL]: manifestWith('5.9.1001'), [FORK_BASE_URL]: forkBase('3.594.0'), [MARKETPLACE_URL]: upstreamAt('3.595.0') });
+  const message = await stopMessage(home, request);
+  assert.match(message, /sidequest 5\.9\.1000 → 5\.9\.1001/);
+  assert.match(message, /fork sync due/);
 });
 
 test('an upstream source keeps reading the upstream manifest', async (testContext) => {

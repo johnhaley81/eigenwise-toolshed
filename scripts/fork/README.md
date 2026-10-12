@@ -43,6 +43,23 @@ Run from the repository root, on `live`, with a clean working tree.
 The script does not touch release fragments or changelogs, and it never runs
 `scripts/release/cut.mjs`. That keeps `live` easy to merge with upstream.
 
+## The upstream base and the sync reminder
+
+Every `--write` also writes `.claude-plugin/fork-base.json` in the same commit. It records the
+upstream marketplace version the run compared against, for example
+`{ "upstream": { "repo": "Eigenwise/eigenwise-toolshed", "ref": "main" }, "marketplaceVersion": "3.594.0" }`.
+`--dry-run` prints the base it would record and writes nothing. The file exists only on the fork,
+so merging upstream never conflicts on it. If no plugin version moves but the base changes, the
+script still commits the base alone (`fork base <version>`) and there is nothing to tag.
+
+A machine that installs Toolshed from the fork has no other way to learn that Eigenwise released.
+Quartermaster fills that gap. Once an hour it reads `fork-base.json` from the fork it installs from
+and the marketplace file at the upstream repo and ref named there. When Eigenwise's version is higher
+than the recorded base, the next prompt and the next Stop in each session show "Toolshed fork sync
+due" once per upstream version. To clear it, merge upstream `main` into `live`, run the suites, and
+follow the release flow above, so the new base is recorded. A fork with no `fork-base.json`, or an
+upstream that cannot be reached, shows nothing.
+
 ## Tests
 
 ```
