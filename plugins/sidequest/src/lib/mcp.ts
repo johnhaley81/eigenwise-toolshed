@@ -75,6 +75,8 @@ const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 // compactSchema strips the authored one. update.addFiles/removeFiles and scopeRequest.grant (GitHub #173)
 // are +535 bytes compacted. Measured at 25332 payload bytes on the merged tree with both in, so the cap is
 // set to 27900 and the 2.5KB reserve still holds.
+// The GH-424 add/update schema parity merged on top of both measures 25343 payload bytes, so 27900 keeps the
+// 2.5KB reserve (2557 bytes) and the cap does not move.
 const MCP_TOOLS_LIST_MAX_BYTES = 27900;
 const MCP_TOOLS_LIST_HEADROOM_BYTES = 2500;
 
@@ -193,6 +195,23 @@ function argumentSuggestion(key: string, allowed: Set<string>) {
   return matches.length === 1 ? ` did you mean ${matches[0]}?` : '';
 }
 
+// Callers write "A depends on B" as {from: A, dependsOn: B} or spell the verb dependsOn. Both are the existing
+// depends-on relation, so neither costs a schema property in the byte-budgeted tools/list (GH-424).
+function dependsOnConflicts(args: any) {
+  return args.to !== undefined || (args.verb !== undefined && args.verb !== 'depends-on');
+}
+
+function foldLinkDependsOn(args: any, aliases: string[]) {
+  if (args.verb === 'dependsOn') args.verb = 'depends-on';
+  if (args.dependsOn === undefined) return;
+  if (dependsOnConflicts(args)) {
+    throw new Error('link: dependsOn names the target of a depends-on link; pass dependsOn alone or verb + to, not both.');
+  }
+  Object.assign(args, { verb: 'depends-on', to: args.dependsOn });
+  delete args.dependsOn;
+  aliases.push('accepted dependsOn as verb "depends-on" + to');
+}
+
 function validateToolArguments(tool: ToolDefinition, rawArgs: any) {
   if (!rawArgs || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) {
     throw new Error(`${tool.name}: arguments must be an object.`);
@@ -206,6 +225,7 @@ function validateToolArguments(tool: ToolDefinition, rawArgs: any) {
     delete args[from];
     aliases.push(`accepted ${from} as ${to}`);
   }
+  if (tool.name === 'link') foldLinkDependsOn(args, aliases);
   if (args.priority === COERCED_PRIORITY.from) {
     args.priority = COERCED_PRIORITY.to;
     aliases.push(`accepted priority "${COERCED_PRIORITY.from}" as "${COERCED_PRIORITY.to}"`);
@@ -264,15 +284,21 @@ function assertMutationFreshness(projectArg: unknown) {
   if (freshness.refusal) throw new Error(freshness.refusal);
 }
 
-function groomCloseArgs(tool: ToolDefinition, args: Record<string, unknown>) {
-  if (tool.name !== 'groomClose' || String(args.by || '').trim()) return args;
+// Control-plane mutations name no worker of their own, so the main session's runtime identity is the caller
+// when `by` is omitted. rework is here too: the store's candidate-owner check still judges the defaulted value,
+// and the PreToolUse hook settles a subagent caller before this runs: rework gets its dispatch owner label, the other
+// two are refused, so this default only ever serves the main thread (GH-424, SQ-160).
+const CONTROL_PLANE_DEFAULT_BY = new Set(['groomClose', 'rework', 'supersede_submission']);
+
+function controlPlaneByArgs(tool: ToolDefinition, args: Record<string, unknown>) {
+  if (!CONTROL_PLANE_DEFAULT_BY.has(tool.name) || String(args.by || '').trim()) return args;
   const sessionId = runtimeSessionId();
   return sessionId ? Object.assign({}, args, { by: sessionId }) : args;
 }
 
 async function runTool(tool: ToolDefinition, rawArgs: any) {
   const validated = validateToolArguments(tool, rawArgs);
-  const args = groomCloseArgs(tool, validated.args);
+  const args = controlPlaneByArgs(tool, validated.args);
   const { aliases } = validated;
   if (!toolMutates(tool.name, args)) {
     const output = await tool.handler(args);
@@ -447,6 +473,7 @@ module.exports = {
   MCP_TOOLS_LIST_HEADROOM_BYTES,
   ARGUMENT_ALIASES,
   COERCED_PRIORITY,
+  CONTROL_PLANE_DEFAULT_BY,
   TOOLS,
   toolDescriptors,
   toolDescriptorByteReport,
