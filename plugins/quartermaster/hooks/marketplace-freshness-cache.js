@@ -5,18 +5,44 @@ const fs = require('node:fs');
 const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
+const { readJson } = require('./freshness-helpers.js');
 
 const CACHE_MAX_AGE_MS = 60 * 60 * 1000;
-const MARKETPLACE_URL = 'https://raw.githubusercontent.com/Eigenwise/eigenwise-toolshed/main/.claude-plugin/marketplace.json';
+const MARKETPLACE_NAME = 'eigenwise-toolshed';
+const GITHUB_REPOSITORY_URL = /^(?:https:\/\/|git@)github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?\/?$/;
 const REQUEST_TIMEOUT_MS = 5_000;
+
+function rawManifestUrl(repository, ref) {
+  return `https://raw.githubusercontent.com/${repository}/${ref || 'main'}/.claude-plugin/marketplace.json`;
+}
+
+const MARKETPLACE_URL = rawManifestUrl('Eigenwise/eigenwise-toolshed');
+
+function sourceRepository(source) {
+  if (source?.source === 'github') return source.repo;
+  return source?.source === 'git' ? GITHUB_REPOSITORY_URL.exec(source.url)?.[1] : undefined;
+}
+
+// Update reminders must follow the source /update-toolshed refreshes from, which is whatever Claude Code registered.
+function manifestUrl(fileSystem = fs, home = os.homedir()) {
+  const registry = readJson(fileSystem, path.join(home, '.claude', 'plugins', 'known_marketplaces.json'));
+  const source = registry?.[MARKETPLACE_NAME]?.source;
+  const repository = sourceRepository(source);
+  return repository ? rawManifestUrl(repository, source.ref) : MARKETPLACE_URL;
+}
 
 function cacheFile(home = os.homedir()) {
   return path.join(home, '.claude', 'eigenwise-toolshed', 'marketplace-freshness.json');
 }
 
-function readCache(fileSystem = fs, home = os.homedir()) {
+// A cache written before its URL was recorded always came from upstream.
+function cacheForUrl(cache, url) {
+  return (cache?.url ?? MARKETPLACE_URL) === url ? cache : null;
+}
+
+function readCache(fileSystem = fs, home = os.homedir(), url = manifestUrl(fileSystem, home)) {
   try {
-    return JSON.parse(fileSystem.readFileSync(cacheFile(home), 'utf8'));
+    return cacheForUrl(JSON.parse(fileSystem.readFileSync(cacheFile(home), 'utf8')), url);
   } catch (_) {
     return null;
   }
@@ -27,9 +53,9 @@ function cacheIsCurrent(cache, now = Date.now()) {
   return Number.isFinite(checkedAt) && now - checkedAt >= 0 && now - checkedAt < CACHE_MAX_AGE_MS;
 }
 
-function requestManifest(request = https.get, timeoutMs = REQUEST_TIMEOUT_MS) {
+function requestManifest(request = https.get, timeoutMs = REQUEST_TIMEOUT_MS, url = manifestUrl()) {
   return new Promise((resolve, reject) => {
-    const response = request(MARKETPLACE_URL, { headers: { accept: 'application/json' } }, (incoming) => {
+    const response = request(url, { headers: { accept: 'application/json' } }, (incoming) => {
       let body = '';
       incoming.setEncoding('utf8');
       incoming.on('data', (chunk) => { body += chunk; });
@@ -60,22 +86,27 @@ function writeCache(cache, fileSystem = fs, home = os.homedir()) {
   fileSystem.renameSync(temporary, destination);
 }
 
+function writeCacheIfPossible(cache, options) {
+  try {
+    writeCache(cache, options.fileSystem, options.home);
+  } catch (_) {
+    // The prompt guard still treats an unwritable cache as unknown.
+  }
+}
+
 async function refreshCache(options = {}) {
   const now = options.now ?? Date.now();
-  const existing = readCache(options.fileSystem, options.home);
+  const url = manifestUrl(options.fileSystem, options.home);
+  const existing = readCache(options.fileSystem, options.home, url);
   if (cacheIsCurrent(existing, now)) return existing;
   try {
-    const manifest = await (options.requestManifest || requestManifest)();
-    const cache = { checkedAt: new Date(now).toISOString(), manifest };
+    const manifest = await (options.requestManifest || requestManifest)(options.request, undefined, url);
+    const cache = { checkedAt: new Date(now).toISOString(), url, manifest };
     writeCache(cache, options.fileSystem, options.home);
     return cache;
   } catch (_) {
-    const cache = { checkedAt: new Date(now).toISOString(), unavailable: true };
-    try {
-      writeCache(cache, options.fileSystem, options.home);
-    } catch (_) {
-      // The prompt guard still treats an unwritable cache as unknown.
-    }
+    const cache = { checkedAt: new Date(now).toISOString(), url, unavailable: true };
+    writeCacheIfPossible(cache, options);
     return cache;
   }
 }
@@ -93,6 +124,7 @@ module.exports = {
   REQUEST_TIMEOUT_MS,
   cacheFile,
   cacheIsCurrent,
+  manifestUrl,
   readCache,
   refreshCache,
   requestManifest,

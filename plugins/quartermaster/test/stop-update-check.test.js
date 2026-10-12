@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { CACHE_MAX_AGE_MS, readCache } = require('../hooks/marketplace-freshness-cache.js');
+const { CACHE_MAX_AGE_MS, MARKETPLACE_URL, readCache } = require('../hooks/marketplace-freshness-cache.js');
 const { loadedVersionStateFile, reportLoadedPluginVersion } = require('../hooks/freshness-helpers.js');
 const { decide: decideUserPrompt } = require('../hooks/user-prompt-freshness.js');
 const { decide } = require('../hooks/stop-update-check.js');
@@ -73,7 +73,7 @@ test('refreshes a stale cache before reporting an available update', async (test
   }));
 
   assert.equal(requests, 1);
-  assert.deepEqual(readCache(fs, home), cacheAt(NOW, '2.0.0'));
+  assert.deepEqual(readCache(fs, home), { ...cacheAt(NOW, '2.0.0'), url: MARKETPLACE_URL });
   assert.match(JSON.parse(output).systemMessage, /quartermaster 1\.0\.0 → 2\.0\.0/);
 });
 

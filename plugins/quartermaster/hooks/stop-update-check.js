@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   cacheIsCurrent,
+  manifestUrl,
   readCache,
   requestManifest,
   writeCache,
@@ -44,37 +45,53 @@ function activeToolshedInstances(input, options) {
   return activeInstances(readJson(fileSystem, registryFile) || {}, input.cwd, MARKETPLACE, options.platform);
 }
 
-function refreshManifest(options) {
+function refreshManifest(options, url) {
   if (options.requestManifest) return options.requestManifest();
-  return requestManifest(options.request, options.requestTimeoutMs ?? REFRESH_TIMEOUT_MS);
+  return requestManifest(options.request, options.requestTimeoutMs ?? REFRESH_TIMEOUT_MS, url);
 }
 
-async function decide(input, options = {}) {
-  const environment = options.environment || process.env;
-  if (input?.stop_hook_active || !input?.session_id || environment.EIGENWISE_TOOLSHED_FRESHNESS_BYPASS === '1') return '';
+function environmentOf(options) {
+  return options.environment || process.env;
+}
 
+function isSkipped(input, options) {
+  return Boolean(input?.stop_hook_active || !input?.session_id || environmentOf(options).EIGENWISE_TOOLSHED_FRESHNESS_BYPASS === '1');
+}
+
+async function refreshedCache(options, now, fileSystem, home, url) {
+  try {
+    const refreshed = { checkedAt: new Date(now).toISOString(), url, manifest: await refreshManifest(options, url) };
+    writeCache(refreshed, fileSystem, home);
+    return refreshed;
+  } catch {
+    return null;
+  }
+}
+
+async function loadCache(options, now) {
   const fileSystem = options.fileSystem || fs;
   const home = options.home || os.homedir();
-  const now = options.now ?? Date.now();
-  let cache = options.cache === undefined ? readCache(fileSystem, home) : options.cache;
-  if (!cacheIsCurrent(cache, now)) {
-    try {
-      const manifest = await refreshManifest(options);
-      cache = { checkedAt: new Date(now).toISOString(), manifest };
-      writeCache(cache, fileSystem, home);
-    } catch {
-      cache = null;
-    }
-  }
+  const url = manifestUrl(fileSystem, home);
+  const cache = options.cache === undefined ? readCache(fileSystem, home, url) : options.cache;
+  return cacheIsCurrent(cache, now) ? cache : refreshedCache(options, now, fileSystem, home, url);
+}
 
-  const instances = activeToolshedInstances(input, options);
-  const messages = [];
+function remoteMessages(instances, cache, input, options, now) {
   const updates = remoteUpdates(instances, cache?.manifest);
-  if (updates.length && warnOnce(input, 'stop-remote', options, availableVersionsKey(updates))) {
-    messages.push(remoteWarning(instances, cache, now));
-  }
+  const warn = updates.length && warnOnce(input, 'stop-remote', options, availableVersionsKey(updates));
+  return warn ? [remoteWarning(instances, cache, now)] : [];
+}
 
-  const pluginRoot = options.pluginRoot || environment.CLAUDE_PLUGIN_ROOT;
+function reportedReloadMessages(instances, input, options) {
+  const reportedUpdates = reportedReloads(instances, input, options);
+  const warn = reportedUpdates.length && warnOnce(input, 'stop-reload', options, installedVersionsKey(reportedUpdates));
+  return warn ? [reportedReloadWarning(reportedUpdates)] : [];
+}
+
+function reloadMessages(instances, input, options) {
+  const fileSystem = options.fileSystem || fs;
+  const messages = [];
+  const pluginRoot = options.pluginRoot || environmentOf(options).CLAUDE_PLUGIN_ROOT;
   const loadedVersion = loadedPluginVersion(fileSystem, pluginRoot);
   reportLoadedPluginVersion(input, 'quartermaster@eigenwise-toolshed', loadedVersion, {
     directory: options.loadedVersionStateDirectory,
@@ -85,12 +102,19 @@ async function decide(input, options = {}) {
   if (installedVersion && warnOnce(input, 'stop-reload', options, `quartermaster@${installedVersion}`)) {
     messages.push(reloadWarning(installedVersion, loadedVersion));
   }
+  return [...messages, ...reportedReloadMessages(instances, input, options)];
+}
 
-  const reportedUpdates = reportedReloads(instances, input, options);
-  if (reportedUpdates.length && warnOnce(input, 'stop-reload', options, installedVersionsKey(reportedUpdates))) {
-    messages.push(reportedReloadWarning(reportedUpdates));
-  }
+async function decide(input, options = {}) {
+  if (isSkipped(input, options)) return '';
 
+  const now = options.now ?? Date.now();
+  const cache = await loadCache(options, now);
+  const instances = activeToolshedInstances(input, options);
+  const messages = [
+    ...remoteMessages(instances, cache, input, options, now),
+    ...reloadMessages(instances, input, options),
+  ];
   return messages.length ? JSON.stringify({ systemMessage: messages.join('\n') }) : '';
 }
 
