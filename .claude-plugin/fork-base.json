@@ -1,0 +1,7 @@
+{
+  "upstream": {
+    "repo": "Eigenwise/eigenwise-toolshed",
+    "ref": "main"
+  },
+  "marketplaceVersion": "3.594.0"
+}
