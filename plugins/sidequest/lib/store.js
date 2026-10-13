@@ -1044,7 +1044,9 @@ function changeTestNames(root, change, files) {
 function foreignTips(slug, ticket, root) {
   const refs = commitScope.integrationTargetRefs(ticketIntegrationTarget(slug, ticket));
   if (!refs.length) return [];
-  return gitOutput(root, ["for-each-ref", "--no-contains", "HEAD", "--format=%(objectname) %(refname)", ...refs]).split(/\r?\n/).map((line) => line.split(" ")).filter(([, ref]) => refs.includes(String(ref))).map(([tip]) => String(tip));
+  const branch = normalizeIntegrationBranch(readMeta(slug)?.integrationBranch);
+  const isForeign = (ref) => refs.includes(ref) || ref.startsWith("refs/remotes/") && ref.split("/").slice(3).join("/") === branch;
+  return gitOutput(root, ["for-each-ref", "--no-contains", "HEAD", "--format=%(objectname) %(refname)", ...refs, `refs/remotes/*/${branch}`]).split(/\r?\n/).map((line) => line.split(" ")).filter(([, ref]) => isForeign(String(ref))).map(([tip]) => String(tip));
 }
 function commitChange(line) {
   const [commit = "", ...parents] = line.split(" ");
@@ -1084,16 +1086,6 @@ function negativeControlChanges(slug, ticket, delta, changedPaths) {
   const workspace = delta?.workspace;
   if (!workspace?.base) return { paths: changedPaths, testNames: [] };
   return attributeOwnChanges(slug, ticket, workspace, delta.working, changedPaths);
-}
-function mixedChange(paths) {
-  return paths.some(isTestSidePath) && paths.some((file) => !isTestSidePath(file));
-}
-function negativeControlCheck(slug, ticket, delta, changedPaths) {
-  if (!mixedChange(changedPaths)) return null;
-  const own = negativeControlChanges(slug, ticket, delta, changedPaths);
-  if (!mixedChange(own.paths)) return null;
-  const negativeControl = negativeControlResult(ticket, own.testNames);
-  return ["failed", "waived"].includes(negativeControl.kind) ? null : negativeControlRefusal(ticket, negativeControl);
 }
 function mergeResolvedPaths(workspace) {
   if (!workspace?.base) return [];
@@ -1260,12 +1252,15 @@ function isBehaviorSourcePath(file) {
   const normalized = file.replace(/\\/g, "/");
   return /\.(?:[cm]?[jt]sx?|py|php|rb|go|rs|java|cs|c|cpp|h|sh|vue|svelte)$/.test(normalized) && !/(?:^|\/)(?:fixtures?|docs?|examples?)(?:\/|$)|\.d\.[cm]?ts$/.test(normalized);
 }
-function ownedControlCheck(ticket, delta, ownedPaths) {
+function mixedChange(paths) {
+  return [paths.some(isTestSidePath), paths.filter((file) => !isTestSidePath(file)).some(isBehaviorSourcePath)].every(Boolean);
+}
+function ownedControlCheck(slug, ticket, delta, ownedPaths) {
   const kind = ticket.dispatch?.workProvenance?.kind;
   if (["behavior-preserving-refactor", "inherited-read-only", "docs", "type-annotation-only", "fixture-only"].includes(String(kind))) return { ok: true, negativeControl: "not_required(" + kind + ")" };
-  const mixed = [ownedPaths.some(isTestSidePath), ownedPaths.filter((file) => !isTestSidePath(file)).some(isBehaviorSourcePath)].every(Boolean);
-  if ([!kind, !mixed].every(Boolean)) return { ok: true, negativeControl: "not_required(no changed source under changed tests)" };
-  const control = negativeControlResult(ticket, changedTestNames(delta, ownedPaths));
+  const own = negativeControlChanges(slug, ticket, delta, ownedPaths);
+  if ([!kind, !mixedChange(own.paths)].every(Boolean)) return { ok: true, negativeControl: "not_required(no changed source under changed tests)" };
+  const control = negativeControlResult(ticket, own.testNames);
   return ["failed", "waived"].includes(control.kind) ? { ok: true, negativeControl: control.kind } : negativeControlRefusal(ticket, control);
 }
 function completionTreeCheck(slug, ticket, opts) {
@@ -1274,7 +1269,7 @@ function completionTreeCheck(slug, ticket, opts) {
   if (!facts.applicable) return facts;
   const emptyWithoutDeclaration = [!facts.changedPaths.length, opts?.explicitNoOp !== true].every(Boolean);
   if ([emptyWithoutDeclaration, facts.provenance?.kind !== "inherited-read-only"].every(Boolean)) return emptyScopeCompletion(ticket, facts.declaredFiles);
-  const control = ownedControlCheck(ticket, facts.delta, facts.ownedPaths);
+  const control = ownedControlCheck(slug, ticket, facts.delta, facts.ownedPaths);
   if (!control.ok) return control;
   return {
     ok: true,

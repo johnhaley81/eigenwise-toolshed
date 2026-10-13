@@ -250,3 +250,82 @@ test('GH-160: commits fast-forwarded from the integration branch are not the can
   const completion = store.addComment(slug, ticket.ref, { by, body: verified, source: 'mcp' });
   assert.equal(completion.ok, true, completion.message);
 });
+
+// A fork PR rework's integration branch is the PR branch, which upstream develop's commits never reach.
+// The board's integration branch is develop, so a remote's develop is the reviewed line; any other
+// remote-tracking ref is a pushed branch nobody has reviewed. A null remoteRef leaves the branch local.
+function mergeFromBranch(project: ReturnType<typeof fixtureProject>, remoteRef: string | null) {
+  const { git, write, commit } = project;
+  const upstreamWork = {
+    'test/upstream.test.js': "test('upstream develop test', () => {\n  upstream();\n});\n",
+    'test/fixture.test.js': "test('shared test', () => {\n  sharedUpstream();\n});\n\ntest('resolution test', () => {\n  resolution();\n});\n",
+  };
+  git(['branch', 'pr']);
+  git(['checkout', '-b', 'upstream-work']);
+  const tip = commit(upstreamWork, 'upstream develop');
+  git(['checkout', 'main']);
+  assert.equal(store.setBoardConfig(project.slug, { integrationBranch: 'develop' }).ok, true);
+  if (remoteRef) {
+    git(['update-ref', remoteRef, tip]);
+    git(['branch', '-D', 'upstream-work']);
+  }
+  return {
+    write,
+    merge: (resolve?: () => void) => {
+      git(['merge', '--no-commit', '--no-ff', tip]);
+      resolve?.();
+      git(['add', '.']);
+      git(['commit', '--no-edit']);
+    },
+  };
+}
+
+const prBranch = { integrationBranch: 'pr', integrationMode: 'local' };
+
+test('SQ-176: tests merged in from a remote\'s copy of the integration branch are not the candidate\'s', () => {
+  const project = fixtureProject('sq-negative-control-published-');
+  const by = 'published-merge-executor';
+  const { merge } = mergeFromBranch(project, 'refs/remotes/upstream/develop');
+  const ticket = claimSharedTree(project.slug, by, prBranch);
+
+  project.commit(ownWork, 'own work');
+  merge();
+
+  assert.equal(store.addComment(project.slug, ticket.ref, { by, body: `${control}\n[sidequest:negative-control-test] failed own change test`, source: 'mcp' }).ok, true);
+  const completion = store.addComment(project.slug, ticket.ref, { by, body: verified, source: 'mcp' });
+  assert.equal(completion.ok, true, completion.message);
+});
+
+test('SQ-176: a test only the resolution of a remote integration branch merge changed is still demanded', () => {
+  const project = fixtureProject('sq-negative-control-published-resolution-');
+  const by = 'published-resolution-executor';
+  const { merge, write } = mergeFromBranch(project, 'refs/remotes/upstream/develop');
+  const ticket = claimSharedTree(project.slug, by, prBranch);
+
+  project.commit(ownWork, 'own work');
+  merge(() => write('test/fixture.test.js', "test('shared test', () => {\n  sharedUpstream();\n});\n\ntest('resolution test', () => {\n  resolvedInTheMerge();\n});\n"));
+
+  assert.equal(store.addComment(project.slug, ticket.ref, { by, body: `${control}\n[sidequest:negative-control-test] failed own change test`, source: 'mcp' }).ok, true);
+  const refusal = store.addComment(project.slug, ticket.ref, { by, body: verified, source: 'mcp' });
+  assert.equal(refusal.reason, 'negative_control_test_required');
+  assert.match(refusal.message, /resolution test/);
+  assert.doesNotMatch(refusal.message, /upstream develop test|shared test/);
+});
+
+test('SQ-176: tests merged in from a local-only branch or a pushed feature branch are still the candidate\'s own', () => {
+  for (const [shape, remoteRef] of [['local-only', null], ['pushed-feature', 'refs/remotes/origin/some-feature']] as const) {
+    const project = fixtureProject(`sq-negative-control-${shape}-`);
+    const by = `${shape}-merge-executor`;
+    const { merge } = mergeFromBranch(project, remoteRef);
+    const ticket = claimSharedTree(project.slug, by, prBranch);
+
+    project.commit(ownWork, 'own work');
+    merge();
+
+    assert.equal(store.addComment(project.slug, ticket.ref, { by, body: control, source: 'mcp' }).ok, true);
+    const refusal = store.addComment(project.slug, ticket.ref, { by, body: verified, source: 'mcp' });
+    assert.equal(refusal.reason, 'negative_control_test_required', `${shape}: ${refusal.message}`);
+    assert.match(refusal.message, /upstream develop test/);
+    assert.match(refusal.message, /own change test/);
+  }
+});

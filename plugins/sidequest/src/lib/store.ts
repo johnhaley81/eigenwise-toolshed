@@ -1058,13 +1058,19 @@ function changeTestNames(root: string, change: OwnChange, files: string[]) {
     .filter((name): name is string => Boolean(name));
 }
 
-// Integration refs that do not already contain HEAD: a shared tree commits on its integration
-// branch directly, so that branch cannot tell this candidate's commits from anyone else's.
+// Tips of what was written somewhere other than this candidate: the integration refs, and every
+// remote's copy of the board's integration branch, that do not already contain HEAD. A shared tree
+// commits on its integration branch directly, so that branch cannot tell this candidate's commits
+// from anyone else's. A remote's copy covers upstream develop merged into a fork PR branch, whose
+// integration target never held it. Only that reviewed line counts: a pushed feature branch has not
+// been reviewed, so the tests it carries still need the candidate's negative control.
 function foreignTips(slug: any, ticket: any, root: string) {
   const refs = commitScope.integrationTargetRefs(ticketIntegrationTarget(slug, ticket));
   if (!refs.length) return [];
-  return gitOutput(root, ['for-each-ref', '--no-contains', 'HEAD', '--format=%(objectname) %(refname)', ...refs])
-    .split(/\r?\n/).map((line) => line.split(' ')).filter(([, ref]) => refs.includes(String(ref))).map(([tip]) => String(tip));
+  const branch = normalizeIntegrationBranch(readMeta(slug)?.integrationBranch);
+  const isForeign = (ref: string) => refs.includes(ref) || (ref.startsWith('refs/remotes/') && ref.split('/').slice(3).join('/') === branch);
+  return gitOutput(root, ['for-each-ref', '--no-contains', 'HEAD', '--format=%(objectname) %(refname)', ...refs, `refs/remotes/*/${branch}`])
+    .split(/\r?\n/).map((line) => line.split(' ')).filter(([, ref]) => isForeign(String(ref))).map(([tip]) => String(tip));
 }
 
 function commitChange(line: string): OwnChange {
@@ -1072,10 +1078,10 @@ function commitChange(line: string): OwnChange {
   return parents.length > 1 ? { merge: commit } : { from: parents[0] || EMPTY_TREE, to: commit };
 }
 
-// The candidate's own commits are the ones since base that no integration ref reaches: what a merge
-// brought in from the integration branch was written and tested there (GH-160). A commit merged in
-// from anywhere else is walked as the candidate's own. Null when no integration ref reaches into the
-// range, which leaves the whole range the candidate's.
+// The candidate's own commits are the ones since base that no integration ref and no remote's copy
+// of the integration branch reaches: what a merge brought in from there was written and tested there
+// (GH-160). A commit merged in from any other branch, pushed or not, is walked as the candidate's
+// own. Null when no such ref reaches into the range, which leaves the whole range the candidate's.
 function ownChanges(slug: any, ticket: any, root: string, base: string): OwnChange[] | null {
   const tips = foreignTips(slug, ticket, root);
   if (!tips.length) return null;
@@ -1118,20 +1124,6 @@ function negativeControlChanges(slug: any, ticket: any, delta: any, changedPaths
   const workspace = delta?.workspace;
   if (!workspace?.base) return { paths: changedPaths, testNames: [] as string[] };
   return attributeOwnChanges(slug, ticket, workspace, delta.working, changedPaths);
-}
-
-function mixedChange(paths: string[]) {
-  return paths.some(isTestSidePath) && paths.some((file: string) => !isTestSidePath(file));
-}
-
-// The negative control answers only for the candidate's own changes: when those mix test-side and
-// non-test-side paths, every test they added or modified needs its marker.
-function negativeControlCheck(slug: any, ticket: any, delta: any, changedPaths: string[]) {
-  if (!mixedChange(changedPaths)) return null;
-  const own = negativeControlChanges(slug, ticket, delta, changedPaths);
-  if (!mixedChange(own.paths)) return null;
-  const negativeControl = negativeControlResult(ticket, own.testNames);
-  return ['failed', 'waived'].includes(negativeControl.kind) ? null : negativeControlRefusal(ticket, negativeControl);
 }
 
 // diff-tree prints nothing for a merge, so the committed paths miss a file that only a merge's
@@ -1343,7 +1335,7 @@ function completionWorkFacts(slug: string, ticket: ProvenanceCompletionTicket): 
   if (!eligible.every(Boolean)) return { ok: true, applicable: false };
   const delta = dispatchDelta(slug, ticket);
   if (!delta.ok) return { ok: true, applicable: false, unavailable: true };
-  const changedPaths: string[] = Array.from(new Set<string>([...delta.working, ...delta.committed]))
+  const changedPaths: string[] = Array.from(new Set<string>([...delta.working, ...delta.committed, ...mergeResolvedPaths(delta.workspace)]))
     .filter(file => commitScope.isInScope(file, declaredFiles)).sort();
   try {
     const ownedPaths = ownedWorkPaths(delta.workspace.root, state.workProvenance, changedPaths, ref => getTicket(slug, ref));
@@ -1368,12 +1360,18 @@ function isBehaviorSourcePath(file: string) {
     && !/(?:^|\/)(?:fixtures?|docs?|examples?)(?:\/|$)|\.d\.[cm]?ts$/.test(normalized);
 }
 
-function ownedControlCheck(ticket: ProvenanceCompletionTicket, delta: unknown, ownedPaths: string[]) {
+function mixedChange(paths: string[]) {
+  return [paths.some(isTestSidePath), paths.filter(file => !isTestSidePath(file)).some(isBehaviorSourcePath)].every(Boolean);
+}
+
+// The control answers for the candidate's own work only: what a merge carried in from the
+// integration branch was written and tested there (GH-160).
+function ownedControlCheck(slug: string, ticket: ProvenanceCompletionTicket, delta: unknown, ownedPaths: string[]) {
   const kind = ticket.dispatch?.workProvenance?.kind;
   if (['behavior-preserving-refactor', 'inherited-read-only', 'docs', 'type-annotation-only', 'fixture-only'].includes(String(kind))) return { ok: true as const, negativeControl: 'not_required(' + kind + ')' };
-  const mixed = [ownedPaths.some(isTestSidePath), ownedPaths.filter(file => !isTestSidePath(file)).some(isBehaviorSourcePath)].every(Boolean);
-  if ([!kind, !mixed].every(Boolean)) return { ok: true as const, negativeControl: 'not_required(no changed source under changed tests)' };
-  const control = negativeControlResult(ticket, changedTestNames(delta, ownedPaths));
+  const own = negativeControlChanges(slug, ticket, delta, ownedPaths);
+  if ([!kind, !mixedChange(own.paths)].every(Boolean)) return { ok: true as const, negativeControl: 'not_required(no changed source under changed tests)' };
+  const control = negativeControlResult(ticket, own.testNames);
   return ['failed', 'waived'].includes(control.kind) ? { ok: true as const, negativeControl: control.kind } : negativeControlRefusal(ticket, control);
 }
 
@@ -1383,7 +1381,7 @@ function completionTreeCheck(slug: string, ticket: ProvenanceCompletionTicket, o
   if (!facts.applicable) return facts;
   const emptyWithoutDeclaration = [!facts.changedPaths.length, opts?.explicitNoOp !== true].every(Boolean);
   if ([emptyWithoutDeclaration, facts.provenance?.kind !== 'inherited-read-only'].every(Boolean)) return emptyScopeCompletion(ticket, facts.declaredFiles);
-  const control = ownedControlCheck(ticket, facts.delta, facts.ownedPaths);
+  const control = ownedControlCheck(slug, ticket, facts.delta, facts.ownedPaths);
   if (!control.ok) return control;
   return { ok: true, applicable: true, changedPaths: facts.changedPaths, ownedPaths: facts.ownedPaths,
     noOp: !facts.changedPaths.length, workProvenance: facts.provenance, negativeControl: control.negativeControl };
