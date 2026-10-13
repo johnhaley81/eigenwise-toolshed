@@ -78,6 +78,7 @@ const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 // Raised from 27900 for update.addFiles/removeFiles and scopeRequest.grant (GitHub #173) and the live-claim
 // files replace refusal (GitHub #403): +535 bytes compacted, measured at 25929 payload bytes on the merged tree, so the
 // 2.5KB reserve holds.
+// Fork sync of upstream v3.595.0 with fork PRs #172, #174, #405, #186, #359 and #426 (GH-424 add/update field parity) on live: measured 25940 payload bytes, so 28500 keeps a 2560 byte reserve and the cap does not move.
 const MCP_TOOLS_LIST_MAX_BYTES = 28500;
 const MCP_TOOLS_LIST_HEADROOM_BYTES = 2500;
 

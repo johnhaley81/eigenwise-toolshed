@@ -1232,7 +1232,7 @@ function completionWorkFacts(slug, ticket) {
   if (!eligible.every(Boolean)) return { ok: true, applicable: false };
   const delta = dispatchDelta(slug, ticket);
   if (!delta.ok) return { ok: true, applicable: false, unavailable: true };
-  const changedPaths = Array.from(/* @__PURE__ */ new Set([...delta.working, ...delta.committed])).filter((file) => commitScope.isInScope(file, declaredFiles)).sort();
+  const changedPaths = Array.from(/* @__PURE__ */ new Set([...delta.working, ...delta.committed, ...mergeResolvedPaths(delta.workspace)])).filter((file) => commitScope.isInScope(file, declaredFiles)).sort();
   try {
     const ownedPaths = (0, import_work_provenance.ownedWorkPaths)(delta.workspace.root, state.workProvenance, changedPaths, (ref) => getTicket(slug, ref));
     return { ok: true, applicable: true, declaredFiles, changedPaths, ownedPaths, delta, provenance: state.workProvenance };
