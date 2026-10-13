@@ -2334,7 +2334,7 @@ test('hooks.json routes every live-claim mutation tool to force-exec-bypass for 
   const toolNames = [...rules.slice(0, rules.indexOf('\n};')).matchAll(/^  (mcp__[\w]+):/gm)].map((match) => match[1]);
   assert.deepEqual(
     [...toolNames].sort(),
-    ['mcp__plugin_sidequest_board__remove', 'mcp__plugin_sidequest_board__scopeRequest', 'mcp__plugin_sidequest_board__update', 'mcp__plugin_sidequest_board__verdict'],
+    ['mcp__plugin_sidequest_board__dispatch', 'mcp__plugin_sidequest_board__remove', 'mcp__plugin_sidequest_board__scopeRequest', 'mcp__plugin_sidequest_board__update', 'mcp__plugin_sidequest_board__verdict'],
     'the rule table changed: route the new tool in hooks.json and list it here',
   );
   for (const toolName of toolNames) {
@@ -2386,7 +2386,7 @@ test('hook manifest routes force-exec-bypass for every live-claim mutation rule 
   const command = 'node hooks/force-exec-bypass.js';
   for (const toolName of toolNames) {
     assert.ok(routesForceExecBypass(preToolUse, toolName), `${toolName} has an authority rule but no force-exec-bypass.js route`);
-    for (const matcher of ['*', toolNames.join('|'), 'mcp__plugin_sidequest_board__(?:dispatch|update|remove|verdict)']) {
+    for (const matcher of ['*', toolNames.join('|'), 'mcp__plugin_sidequest_board__(?:dispatch|update|scopeRequest|remove|verdict)']) {
       assert.ok(routesForceExecBypass([{ matcher, hooks: [{ command }] }], toolName), `${matcher} must route ${toolName}`);
     }
     assert.equal(routesForceExecBypass([{ matcher: `${toolName}_other`, hooks: [{ command }] }], toolName), false, 'a different tool must not route');
