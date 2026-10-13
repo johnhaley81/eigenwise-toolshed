@@ -1193,16 +1193,18 @@ function boundedMarkerLineQuote(markerLine, maxChars = 200) {
   if (markerLine.length <= maxChars) return markerLine;
   return `${markerLine.slice(0, maxChars)} [… ${markerLine.length - maxChars} more characters]`;
 }
+function foundMarkerLineClause(result) {
+  return result.markerLine ? ' (found negative-control marker line "' + boundedMarkerLineQuote(result.markerLine) + '", but ' + result.detail + ")" : "";
+}
 function negativeControlRefusal(ticket, result) {
   const messages = {
     import_error: "the recorded negative control failed with an ImportError",
     collection_error: "the recorded negative control failed with a collection error",
     undeclared_failure_kind: "the negative control must declare failure-kind=assertion, failure-kind=import, or failure-kind=collection",
-    missing_target_or_assertion: "the negative control must name the broken target and the assertion that failed",
+    missing_target_or_assertion: "the negative control must name the broken target and the assertion that failed" + foundMarkerLineClause(result),
     zero_failures: "failed=0 means tests passed against the pre-change code and do not test the change",
     unreported_tests: "the negative control did not report these added or modified tests: " + result.tests?.join(", "),
     short_waiver: "a negative-control waiver needs a reason of at least 20 characters",
-    malformed_marker: 'found negative-control marker line "' + result.markerLine + '", but the number was not where it was expected',
     wrong_author: 'a negative control was recorded by "' + result.by + '", but the current claim holder is "' + ticket.claim?.by + '"',
     missing: "new behavior needs a claim-holder negative control"
   };

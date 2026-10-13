@@ -1280,19 +1280,32 @@ function negativeControlResult(ticket?: any, expectedTestNames: string[] = []) {
   return otherControlAuthor ? { kind: 'wrong_author', by: otherControlAuthor } : { kind: 'missing' };
 }
 
+// Comment bodies are capped at 16000 characters, so echoing a posted marker line back
+// unbounded lets one long line crowd out the recovery recipe that actually tells the
+// agent what to do; quote only a head slice and say how much more there was.
+function boundedMarkerLineQuote(markerLine: string, maxChars = 200): string {
+  if (markerLine.length <= maxChars) return markerLine;
+  return `${markerLine.slice(0, maxChars)} [… ${markerLine.length - maxChars} more characters]`;
+}
+
+// The parse names the field it stopped at, so the refusal quotes the line it read and
+// says where it gave up instead of leaving the agent to guess which field was wrong.
+function foundMarkerLineClause(result: { markerLine?: string; detail?: string }): string {
+  return result.markerLine ? ' (found negative-control marker line "' + boundedMarkerLineQuote(result.markerLine) + '", but ' + result.detail + ')' : '';
+}
+
 type NegativeControlRefusalTicket = { ref?: string; claim?: { by?: string } };
-type NegativeControlFailure = { kind: string; tests?: string[]; markerLines?: string[]; markerLine?: string; by?: string };
+type NegativeControlFailure = { kind: string; tests?: string[]; markerLines?: string[]; markerLine?: string; detail?: string; by?: string };
 
 function negativeControlRefusal(ticket: NegativeControlRefusalTicket, result: NegativeControlFailure) {
   const messages: Record<string, string> = {
     import_error: 'the recorded negative control failed with an ImportError',
     collection_error: 'the recorded negative control failed with a collection error',
     undeclared_failure_kind: 'the negative control must declare failure-kind=assertion, failure-kind=import, or failure-kind=collection',
-    missing_target_or_assertion: 'the negative control must name the broken target and the assertion that failed',
+    missing_target_or_assertion: 'the negative control must name the broken target and the assertion that failed' + foundMarkerLineClause(result),
     zero_failures: 'failed=0 means tests passed against the pre-change code and do not test the change',
     unreported_tests: 'the negative control did not report these added or modified tests: ' + result.tests?.join(', '),
     short_waiver: 'a negative-control waiver needs a reason of at least 20 characters',
-    malformed_marker: 'found negative-control marker line "' + result.markerLine + '", but the number was not where it was expected',
     wrong_author: 'a negative control was recorded by "' + result.by + '", but the current claim holder is "' + ticket.claim?.by + '"',
     missing: 'new behavior needs a claim-holder negative control',
   };

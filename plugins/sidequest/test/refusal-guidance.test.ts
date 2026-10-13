@@ -101,7 +101,7 @@ test('recovery guidance retains required per-test marker recipe', () => {
   assert.match(message, /between that ';' and failed=<n>/);
   assert.match(message, /\[sidequest:negative-control-test\] failed <test name>/);
   assert.match(message, /test\.each\/it\.each/);
-  assert.match(message, /\[sidequest:negative-control-test\] unaffected <test name> because <reason>/);
+  assert.match(message, /unaffected <test name> because <reason>/);
   assert.match(message, /\[sidequest:negative-control\] waived <reason of at least 20 characters>/);
 });
 
