@@ -70,13 +70,11 @@ const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 // Raised from 25400 for update.admitComposition (SQ-3331): +1675 bytes compacted, all of it schema structure,
 // since compactSchema strips its descriptions and update's served description is empty. Trimming other tools
 // could not recover it without dropping callable constraints or pinned contract text, so the 2.5KB reserve holds.
-// Raised from 27075 for two changes that landed on separate branches. board_config.verifyEnvironment
-// (SQ-3423) is +235 bytes compacted, 67 for the key and its enum plus 168 for the served description, since
-// compactSchema strips the authored one. update.addFiles/removeFiles and scopeRequest.grant (GitHub #173)
-// are +535 bytes compacted. Measured at 25332 payload bytes on the merged tree with both in, so the cap is
-// set to 27900 and the 2.5KB reserve still holds.
-// The GH-424 add/update schema parity merged on top of both measures 25343 payload bytes, so 27900 keeps the
-// 2.5KB reserve (2557 bytes) and the cap does not move.
+// Raised from 27075 for board_config.verifyEnvironment (SQ-3423): +235 bytes compacted, 67 for the key and its
+// enum plus 168 for the served description, since compactSchema strips the authored one. Measured at 24797
+// payload bytes on the W1 tree, so the 2.5KB reserve holds.
+// Raised from 27300 for dispatch.workProvenance (SQ-3630): measured payload 25325 bytes, all added schema structure since compactSchema strips the authored description. Keeps the 2.5KB reserve.
+// Raised from 27850 for add/update verifyKind typecheck (SQ-3644): +44 bytes of enum structure, measured 25394 payload bytes. Keeps the 2.5KB reserve.
 const MCP_TOOLS_LIST_MAX_BYTES = 27900;
 const MCP_TOOLS_LIST_HEADROOM_BYTES = 2500;
 
