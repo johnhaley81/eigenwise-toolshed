@@ -1281,9 +1281,6 @@ function completionTreeCheck(slug, ticket, opts) {
     negativeControl: control.negativeControl
   };
 }
-function submissionCompletionTreeCheck(slug, ticket, opts) {
-  return (0, import_work_provenance.provenanceAdmissionHold)(ticket.dispatch?.workProvenance) || completionTreeCheck(slug, ticket, opts);
-}
 const {
   DEFAULT_CLAIM_ABANDON_MIN,
   DEFAULT_CLAIM_GRACE_MIN,
@@ -1575,7 +1572,7 @@ const {
   boundedExcerptForSubmission: (...args) => boundedExcerpt(...args),
   claimReclaimable,
   commitScope,
-  completionTreeCheck: submissionCompletionTreeCheck,
+  completionTreeCheck,
   coerceStatus,
   createComment,
   crypto,
@@ -2870,7 +2867,7 @@ function releaseReasonText(opts) {
   return String(opts.releaseReason || "").trim() || null;
 }
 function terminateReleasedDispatch(request, closeout, terminalOutcome, release, now) {
-  captureTerminalWorktreeRevision(request.slug, closeout.dispatch, now, closeout.releaseWorktreeFacts);
+  captureTerminalWorktreeRevision(request.slug, closeout.t, closeout.dispatch, now, closeout.releaseWorktreeFacts);
   setDispatchTerminal(closeout.t, terminalOutcome, request.opts.source || "cli", {
     failureShape: request.opts.failureShape || release?.kind || "unknown",
     releaseKind: release?.kind,

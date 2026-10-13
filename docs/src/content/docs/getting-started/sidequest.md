@@ -38,6 +38,8 @@ Replace `SQ-N` with the reference Claude gave you. Confirm the answer against th
 
 Once this save-and-read check works, use the story workflow below when the task needs planning or delegated implementation.
 
+When an executor hands back a clean committed checkpoint in a retained worktree, its replacement gets a Resume section first. It names the checkout, pinned commit, handback reason, and last recorded verification result and log. After claiming, the replacement confirms HEAD and runs the pinned verifier on that candidate before continuing (shared-environment checks still wait for delivery). It reads new instructions or missing evidence rather than starting over with the full thread. The complete description, contract, scope, and verifier remain in the briefing.
+
 ## Your first workflow
 
 1. Open the board with `/sidequest:board`, or tell Claude to show your Sidequest board.
@@ -331,7 +333,7 @@ Use Sidequest for independent candidate reviews, repository audits, and shortcut
 
 An explicit per-ticket route can use a different provider when the ticket is effectively readonly. It leaves the category route alone; writable tickets stay with their category's provider.
 
-When a category's route can't run right now (ChatGPT sign-in missing, gateway readiness unavailable, the model gone from the catalog), dispatch uses the category's own `fallback`, even when that's a Claude model. The dispatch result's `fallbackReason` and the executor briefing both say which fallback ran and why the primary couldn't, including the gateway's login or setup command. The global fallback never crosses providers, so a Codex category with no fallback of its own is refused with that same reason. A discovered model whose provider isn't served by Model Gateway (anything but Codex or Grok) still runs as its own id, but Claude Code's Agent tool only takes `sonnet`, `opus`, `haiku`, or `fable` as a model. So Sidequest writes executor definitions named `sidequest-exec-model-<slug>-<effort>` (plus `-readonly-model-` twins) into your user agents folder, each pinning the full id, and spawns them with no model. Only the model and effort pairs some category route or fallback actually uses (on any board on this machine) get a file, and the `-readonly-model-` twin only exists for readonly categories. Session start writes those and removes the rest, so changing a route swaps the files. A dispatch that routes somewhere no category does, like a ticket route override, writes its own file right before the spawn. Your own agent files are never touched.
+When a category's route can't run right now (ChatGPT sign-in missing, gateway readiness unavailable, the model gone from the catalog), dispatch uses the category's own `fallback`, even when that's a Claude model. The dispatch result's `fallbackReason` and the executor briefing both say which fallback ran and why the primary couldn't, including the gateway's login or setup command. That choice happens once, when the dispatch is prepared: if the provider drops out after that, the prepared executor still claims on the route and effort its briefing named, and only the next dispatch falls back. The global fallback never crosses providers, so a Codex category with no fallback of its own is refused with that same reason. A discovered model whose provider isn't served by Model Gateway (anything but Codex or Grok) still runs as its own id, but Claude Code's Agent tool only takes `sonnet`, `opus`, `haiku`, or `fable` as a model. So Sidequest writes executor definitions named `sidequest-exec-model-<slug>-<effort>` (plus `-readonly-model-` twins) into your user agents folder, each pinning the full id, and spawns them with no model. Only the model and effort pairs some category route or fallback actually uses (on any board on this machine) get a file, and the `-readonly-model-` twin only exists for readonly categories. Session start writes those and removes the rest, so changing a route swaps the files. A dispatch that routes somewhere no category does, like a ticket route override, writes its own file right before the spawn. Your own agent files are never touched.
 
 - An explicitly assigned readonly advisor can discuss a bounded architectural/feasibility question directly
   with its builder through available native messaging and inspect authorized source snapshots while
@@ -349,7 +351,7 @@ When a category's route can't run right now (ChatGPT sign-in missing, gateway re
 
 These read-only reports work independently. If Sidequest is not installed in the host, Claude reports that the routed capability is unavailable. Observability can show absolute measurements, though gain stays unmeasured without a matched baseline. Static headline figures and private workflow data do not prove a gain.
 
-Read-only executors run in your session's own permission mode. They don't ask for `bypassPermissions`, and Claude Code ignores `permissionMode` in plugin agent files anyway. They keep Bash so a review can run the suite, but Sidequest refuses the shell write forms inside the checkout they run in: redirects like `echo x > file`, `rm`, `mv`, `touch`, `tee`, `sed -i`, and git commands that change the repository. Scratch files and evidence go outside the checkout. That guard reads the command text, so a script can still write; if you need a hard boundary, keep your session out of bypass mode.
+Read-only executors run in your session's own permission mode. They don't ask for `bypassPermissions`, and Claude Code ignores `permissionMode` in plugin agent files anyway. They keep Bash so a review can run the suite, but Sidequest refuses the shell write forms inside the checkout they run in: redirects like `echo x > file`, `rm`, `mv`, `touch`, `tee`, `sed -i`, and git commands that change the repository. Scratch files and evidence go outside the checkout, including your scratchpad and the system temp directory. The guard keeps quoted text and inline program bodies out of its write targets, and skips content option values such as `-Encoding utf8`. Git mutations remain refused even outside the checkout. That guard reads the command text, so a script can still write; if you need a hard boundary, keep your session out of bypass mode.
 
 ### Denying tools to executors
 
@@ -415,6 +417,10 @@ Ask Claude to set `deniedTools` on the board (`board_config`) or on one category
 
 **The verify-capture wrapper refuses with `verification_capture_command_mismatch`.** The briefing's wrapper line only names the project and ticket, and the wrapper loads the pinned verify command from the ticket itself, so there's nothing to copy by hand. An older briefing still carries the command as a `--base64` blob. When that blob doesn't match the ticket's pinned command (one mistyped character is enough), the wrapper runs nothing and prints both commands. Rerun it without `--base64`.
 
+**An executor submits without retyping its verifier.** Submit uses the dispatch-pinned command and records `verifierSource: pinned`, even if `verify` is omitted or differs. The completed capture must still match the command, candidate, and dispatch attempt. Manual and attestation verifiers still require their evidence.
+
+**A technical blocker has no subprocess exit code.** Release accepts a typed MCP refusal with the tool name, reason code, and message, or captured hook refusal text from the same session. Bare prose still refuses. Failed-command evidence remains accepted.
+
 **Submit refuses a ticket you claimed directly with `verification_capture_required`.** A direct claim has no dispatch briefing, so nothing handed you the wrapper line. The refusal prints it: `node "<plugin>/lib/verify-capture.js" --project "<project>" --ticket "<ref>"`. Run it from the checkout holding the committed candidate, then submit again. It runs the ticket's current verify, so an `update` to the verify after an earlier dispatch is what gets checked, not that dispatch's old command. A capture recorded during the earlier dispatch doesn't count for your claim.
 
 **Verification fails before any edit.** The active claim holder can record `[sidequest:verify-complete] failed: <evidence>` or `[sidequest:verify-complete] could_not_run: <evidence>` before touching the repository. That preserves the failure report only. A passing completion, submit, or done still needs the declared scoped work and required verification.
@@ -457,6 +463,8 @@ The correction appends an audit and comment, preserves the original verdict, com
 
 **Integration stops because the work already landed on the remote.** Your local target branch is behind a commit that already contains the candidate, usually because someone merged it outside the board. Sidequest refuses instead of merging, and it does not move your branch, fetch, or run the check. For a group, it checks every participant before touching anything, so nothing is half delivered. Fetch and bring the local branch forward yourself, then ask Claude to retry the closure.
 
+**A rollback leaves a sibling with `expected_upstream_diverged`.** Sidequest checks the sibling's recorded candidate base against the current target. An independent candidate whose base is still reachable can integrate with its original range and verification capture intact; delivery runs its gate on the current merged tree. A candidate based on missing work stays refused, with the missing ticket and commit named when the board still has that submission. Rollback keeps sibling capture records unchanged.
+
 **A submission sat so long it can no longer be integrated.** Ask Claude to check whether the requested behavior already reached the intended branch. If it did, Claude records that evidence; if it did not, the work needs a fresh ticket against current source.
 
 ## Support
@@ -471,14 +479,25 @@ See the [generated Sidequest reference](../../reference/sidequest/) for agent-fa
 The main Claude thread can freeze `dispatch.workProvenance` as `new-behavior`,
 `behavior-preserving-refactor`, or `inherited-read-only`. Sources name an exact native producer
 generation and its immutable owned commit. Sidequest records the source/test bytes and any
-existing capture's candidate, command and nonce. Changed bytes or generations refuse. Workers
+existing capture's candidate, command and nonce. Changed bytes or generations refuse. When a
+producer fast-forwarded a whole branch first (say a trial branch), the commits reachable from a
+branch holding none of its own work count as inherited; only commits after that inherited tip are
+checked for ownership and scope, and the tip is frozen on the source. Workers
 cannot grant this authority to themselves, and a declaration cannot change a running dispatch.
+
+Older generations (before 5.10.0, or any whose executor committed with raw git) may lack
+`baseCommit` or `sanctionedCommits`. Sidequest derives those two from the generation's own git
+verification captures, records which capture each came from, and lists them in the admission hold.
+If the base is ambiguous, for example because the candidate already landed on the integration
+branch, the source is still refused and the refusal names the missing fact.
 
 Unchanged inherited tests and declared GREEN refactors don't need fabricated historical reds.
 New owned behavior still needs its own controls. This declaration proves provenance only; its
-execution, quality and admission stay **UNVERIFIED**, and submission stays held. Keep a factual
-checkpoint and release the preparation with its commit and range. A released preparation stays
-unaccepted and cannot replace a pending submission in the existing composition flow.
+execution, quality and admission stay **UNVERIFIED**. While the frozen sources still match, the
+dispatch submits like any other: its submission carries the frozen record, and integration runs
+the pinned verifier on the merged tree as usual. If a source drifts, completion and submit refuse.
+The producer's released preparation itself stays unaccepted and cannot replace a pending
+submission in the existing composition flow.
 
 ## Work kind and completion oracle
 

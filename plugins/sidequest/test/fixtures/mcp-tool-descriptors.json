@@ -1147,6 +1147,40 @@
           "type": "string",
           "description": "Required for blocker/contradiction."
         },
+        "mcpRefusal": {
+          "type": "object",
+          "properties": {
+            "tool": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool",
+            "reason",
+            "message"
+          ]
+        },
+        "hookRefusal": {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session",
+            "text"
+          ]
+        },
         "exitCode": {
           "type": "integer"
         },

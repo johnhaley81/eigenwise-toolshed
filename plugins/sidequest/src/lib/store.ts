@@ -73,7 +73,7 @@ const { createRouting } = require('./store/routing.js');
 const { createTickets } = require('./store/tickets.js');
 const { createSubmissions } = require('./store/submissions.js');
 const { createDispatch } = require('./store/dispatch.js');
-import { ownedWorkPaths, provenanceAdmissionHold } from './store/work-provenance';
+import { ownedWorkPaths } from './store/work-provenance';
 import type { WorkProvenance } from './store/work-provenance';
 const { createPaths } = require('./store/paths.js');
 const { createCache } = require('./store/cache.js');
@@ -1387,10 +1387,6 @@ function completionTreeCheck(slug: string, ticket: ProvenanceCompletionTicket, o
     noOp: !facts.changedPaths.length, workProvenance: facts.provenance, negativeControl: control.negativeControl };
 }
 
-function submissionCompletionTreeCheck(slug: string, ticket: ProvenanceCompletionTicket, opts?: { explicitNoOp?: boolean }) {
-  return provenanceAdmissionHold(ticket.dispatch?.workProvenance) || completionTreeCheck(slug, ticket, opts);
-}
-
 const {
   DEFAULT_CLAIM_ABANDON_MIN,
   DEFAULT_CLAIM_GRACE_MIN,
@@ -1680,7 +1676,7 @@ const {
   boundedExcerptForSubmission: (...args: any[]) => boundedExcerpt(...args),
   claimReclaimable,
   commitScope,
-  completionTreeCheck: submissionCompletionTreeCheck,
+  completionTreeCheck,
   coerceStatus,
   createComment,
   crypto,
@@ -3374,7 +3370,7 @@ function releaseReasonText(opts: ReleaseOptions): string | null {
 // The checkout facts were observed before BEGIN, so the terminal revision is captured from them and
 // setDispatchTerminal gets no slug, which keeps it from reading Git under the write lock.
 function terminateReleasedDispatch(request: ReleaseRequest, closeout: ReleaseCloseout, terminalOutcome: string | undefined, release: ReleaseRecord | null, now: string): void {
-  captureTerminalWorktreeRevision(request.slug, closeout.dispatch, now, closeout.releaseWorktreeFacts);
+  captureTerminalWorktreeRevision(request.slug, closeout.t, closeout.dispatch, now, closeout.releaseWorktreeFacts);
   setDispatchTerminal(closeout.t, terminalOutcome, request.opts.source || 'cli', {
     failureShape: request.opts.failureShape || release?.kind || 'unknown',
     releaseKind: release?.kind,

@@ -75,11 +75,10 @@ const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 // payload bytes on the W1 tree, so the 2.5KB reserve holds.
 // Raised from 27300 for dispatch.workProvenance (SQ-3630): measured payload 25325 bytes, all added schema structure since compactSchema strips the authored description. Keeps the 2.5KB reserve.
 // Raised from 27850 for add/update verifyKind typecheck (SQ-3644): +44 bytes of enum structure, measured 25394 payload bytes. Keeps the 2.5KB reserve.
-// Raised from 27900 for update.addFiles/removeFiles and scopeRequest.grant (GitHub #173) and the live-claim
-// files replace refusal (GitHub #403): +535 bytes compacted, measured at 25929 payload bytes on the merged tree, so the
-// 2.5KB reserve holds.
-// Fork sync of upstream v3.595.0 with fork PRs #172, #174, #405, #186, #359 and #426 (GH-424 add/update field parity) on live: measured 25940 payload bytes, so 28500 keeps a 2560 byte reserve and the cap does not move.
-const MCP_TOOLS_LIST_MAX_BYTES = 28500;
+// Raised from 27900 for the GH-424 shared add/update field schema merged with develop: measured 25425 payload bytes, +31 net over develop (add now also accepts externalDeliverable). Keeps the 2.5KB reserve.
+// Raised from 27900 for update.addFiles/removeFiles and scopeRequest.grant (GitHub #173): +535 bytes compacted, measured 25929 payload bytes on the merged tree. Keeps the 2.5KB reserve.
+// Merged 13 Oct: both raises apply (shared field schema plus addFiles/removeFiles/scopeRequest.grant); measured 26255 payload bytes on the merged tree. Keeps the 2.5KB reserve.
+const MCP_TOOLS_LIST_MAX_BYTES = 28800;
 const MCP_TOOLS_LIST_HEADROOM_BYTES = 2500;
 
 function serverVersion() {
