@@ -38,6 +38,7 @@ const { createStories } = require("./store/stories.js");
 const { createComments } = require("./store/comments.js");
 const { createPlans } = require("./store/plans.js");
 const { createReviewCorrections } = require("./store/review-corrections.js");
+const { createReviewFinalization } = require("./store/review-finalization.js");
 const { createCompositionAdmissions } = require("./store/composition-admission.js");
 const { createReads } = require("./store/reads.js");
 const { createClaims } = require("./store/claims.js");
@@ -170,6 +171,10 @@ function executionScope(slug, ticket) {
     return Array.from(/* @__PURE__ */ new Set([...bound, ...effectiveScope(slug, { files: granted })]));
   }
   return effectiveScope(slug, ticket);
+}
+const boardMove = require("./store/move.js");
+function moveProject(oldPath, newPath) {
+  return boardMove.moveProject({ database, transaction, findProject, slugify, projectDir, invalidateStoreCaches }, oldPath, newPath);
 }
 let projectsLayer;
 function ensureProject(...args) {
@@ -990,10 +995,25 @@ function combinedChangedLines(hunk) {
 function changedLines(hunk) {
   return hunk.width > 1 ? combinedChangedLines(hunk) : unifiedChangedLines(hunk);
 }
+const BLANK_OR_COMMENT_LINE = /^\s*(?:$|\/\/|\/\*|\*|#)/;
+function definitionAheadInRun(changed, index, definedAt) {
+  for (let next = index; changed[next]?.line === changed[index].line + next - index; next += 1) {
+    const { line, text } = changed[next];
+    if (!BLANK_OR_COMMENT_LINE.test(text)) return definedAt.get(line) ?? testDefinitionName(text, true);
+  }
+  return null;
+}
 function diffTestNames(source, diff) {
   const definitions = testDefinitions(source);
+  const definedAt = new Map(definitions.map((entry) => [entry.line, entry.name]));
   const nearest = (line) => definitions.filter((entry) => entry.line <= line).at(-1)?.name;
-  return diffHunks(diff).flatMap(changedLines).flatMap((changed) => [testDefinitionName(changed.text, true), nearest(changed.line)]);
+  return diffHunks(diff).flatMap((hunk) => {
+    const changed = changedLines(hunk);
+    return changed.flatMap((entry, index) => [
+      testDefinitionName(entry.text, true),
+      definitionAheadInRun(changed, index, definedAt) ?? nearest(entry.line)
+    ]);
+  });
 }
 function gitOutput(root, args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
@@ -1030,12 +1050,13 @@ function fileTestNames(root, change, file) {
 function mergeDiff(root, merge, file) {
   return gitOutput(root, ["diff-tree", "--cc", "--unified=0", "--no-commit-id", merge, "--", file]);
 }
-function mergeOwnedPaths(root, merge) {
-  return listedPaths(root, ["diff-tree", "--cc", "-r", "--name-only", "-z", "--no-commit-id", merge]).filter((file) => diffHunks(mergeDiff(root, merge, file)).some((hunk) => combinedChangedLines(hunk).length));
+function mergeOwnedPaths(root, merge, changed) {
+  return listedPaths(root, ["diff-tree", "--cc", "-r", "--name-only", "-z", "--no-commit-id", merge]).filter((file) => changed.has(file)).filter((file) => diffHunks(mergeDiff(root, merge, file)).some((hunk) => combinedChangedLines(hunk).length));
 }
-function changePaths(root, change, working) {
-  if ("merge" in change) return mergeOwnedPaths(root, change.merge);
-  return change.to ? listedPaths(root, ["diff", "--name-only", "--no-renames", "-z", change.from, change.to]) : working;
+function changePaths(root, change, working, changed) {
+  if ("merge" in change) return mergeOwnedPaths(root, change.merge, changed);
+  const paths = change.to ? listedPaths(root, ["diff", "--name-only", "--no-renames", "-z", change.from, change.to]) : working;
+  return paths.filter((file) => changed.has(file));
 }
 function changeTestNames(root, change, files) {
   const namesIn = "merge" in change ? (file) => diffTestNames(sourceAt(root, change.merge, file), mergeDiff(root, change.merge, file)) : (file) => fileTestNames(root, change, file);
@@ -1064,7 +1085,7 @@ function ownChangeAttribution(root, changes, working, changedPaths) {
   const owned = /* @__PURE__ */ new Set();
   const names = [];
   for (const change of changes) {
-    const files = changePaths(root, change, working).filter((file) => changed.has(file));
+    const files = changePaths(root, change, working, changed);
     files.forEach((file) => owned.add(file));
     names.push(...changeTestNames(root, change, files));
   }
@@ -1090,7 +1111,7 @@ function negativeControlChanges(slug, ticket, delta, changedPaths) {
 function mergeResolvedPaths(workspace) {
   if (!workspace?.base) return [];
   try {
-    return listedPaths(workspace.root, ["log", "--merges", "--format=", "--cc", "--name-only", "-z", `${workspace.base}..HEAD`]);
+    return listedPaths(workspace.root, ["log", "--merges", "--first-parent", "--format=", "--cc", "--name-only", "-z", `${workspace.base}..HEAD`]);
   } catch (_) {
     return [];
   }
@@ -1234,7 +1255,7 @@ function completionWorkFacts(slug, ticket) {
   if (!delta.ok) return { ok: true, applicable: false, unavailable: true };
   const changedPaths = Array.from(/* @__PURE__ */ new Set([...delta.working, ...delta.committed, ...mergeResolvedPaths(delta.workspace)])).filter((file) => commitScope.isInScope(file, declaredFiles)).sort();
   try {
-    const ownedPaths = (0, import_work_provenance.ownedWorkPaths)(delta.workspace.root, state.workProvenance, changedPaths, (ref) => getTicket(slug, ref));
+    const ownedPaths = (0, import_work_provenance.ownedWorkPaths)(delta.workspace.root, state.workProvenance, changedPaths, (ref) => getTicket(slug, ref), ticket.ref);
     return { ok: true, applicable: true, declaredFiles, changedPaths, ownedPaths, delta, provenance: state.workProvenance };
   } catch (error) {
     return { ok: false, reason: "work_provenance_mismatch", message: error instanceof Error ? error.message : String(error) };
@@ -1467,6 +1488,17 @@ const { correctAcceptedReviewVerdict } = createReviewCorrections({
   getTicket,
   pendingSubmission: pendingSubmissionForTickets,
   isReadOnlyExecutor,
+  submissionReviewRelation,
+  withSourceTicketLock,
+  withTicketLock,
+  createComment,
+  recordBoundReviewOutcome,
+  putTicket,
+  invalidateStoreCaches
+});
+const { finalizeCompletedReview } = createReviewFinalization({
+  getTicket,
+  pendingSubmission: pendingSubmissionForTickets,
   submissionReviewRelation,
   withSourceTicketLock,
   withTicketLock,
@@ -3933,6 +3965,7 @@ module.exports = {
   ticketRecordedCommits,
   deleteProjectExact,
   mergeProject,
+  moveProject,
   setProjectNotify,
   setProjectRouting,
   projectRoutingEnabled,
@@ -3946,6 +3979,7 @@ module.exports = {
   appendExperimentEntry,
   applyExperimentVerdict,
   correctAcceptedReviewVerdict,
+  finalizeCompletedReview,
   admitComposition,
   appendOverturnLine,
   experimentPacket,

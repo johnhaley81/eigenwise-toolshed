@@ -64,6 +64,7 @@ const { createStories } = require('./store/stories.js');
 const { createComments } = require('./store/comments.js');
 const { createPlans } = require('./store/plans.js');
 const { createReviewCorrections } = require('./store/review-corrections.js');
+const { createReviewFinalization } = require('./store/review-finalization.js');
 const { createCompositionAdmissions } = require('./store/composition-admission.js');
 const { createReads } = require('./store/reads.js');
 const { createClaims } = require('./store/claims.js');
@@ -152,6 +153,11 @@ function executionScope(slug?: any, ticket?: any) {
     return Array.from(new Set([...bound, ...effectiveScope(slug, { files: granted })]));
   }
   return effectiveScope(slug, ticket);
+}
+
+const boardMove = require('./store/move.js');
+function moveProject(oldPath: string, newPath: string) {
+  return boardMove.moveProject({ database, transaction, findProject, slugify, projectDir, invalidateStoreCaches }, oldPath, newPath);
 }
 
 let projectsLayer: any;
@@ -979,14 +985,32 @@ function changedLines(hunk: DiffHunk) {
   return hunk.width > 1 ? combinedChangedLines(hunk) : unifiedChangedLines(hunk);
 }
 
-// The tests a diff added or modified: a definition on a changed line, and the definition nearest
-// above each changed line.
+const BLANK_OR_COMMENT_LINE = /^\s*(?:$|\/\/|\/\*|\*|#)/;
+
+// Blank and comment lines that open a run of added lines introduce the test the run goes on to define,
+// so they belong to it and not to the test above them (GH-547). Null when the run reaches code that
+// defines no test, which leaves the line to the test it was added inside.
+function definitionAheadInRun(changed: ChangedLine[], index: number, definedAt: Map<number, string>) {
+  for (let next = index; changed[next]?.line === changed[index]!.line + next - index; next += 1) {
+    const { line, text } = changed[next]!;
+    if (!BLANK_OR_COMMENT_LINE.test(text)) return definedAt.get(line) ?? testDefinitionName(text, true);
+  }
+  return null;
+}
+
+// The tests a diff added or modified: a definition on a changed line, the definition a leading
+// comment introduces, and otherwise the definition nearest above each changed line.
 function diffTestNames(source: string, diff: string) {
   const definitions = testDefinitions(source);
+  const definedAt = new Map(definitions.map((entry) => [entry.line, entry.name]));
   const nearest = (line: number) => definitions.filter((entry) => entry.line <= line).at(-1)?.name;
-  return diffHunks(diff)
-    .flatMap(changedLines)
-    .flatMap((changed) => [testDefinitionName(changed.text, true), nearest(changed.line)]);
+  return diffHunks(diff).flatMap((hunk) => {
+    const changed = changedLines(hunk);
+    return changed.flatMap((entry, index) => [
+      testDefinitionName(entry.text, true),
+      definitionAheadInRun(changed, index, definedAt) ?? nearest(entry.line),
+    ]);
+  });
 }
 
 function gitOutput(root: string, args: string[]): string {
@@ -1038,15 +1062,18 @@ function mergeDiff(root: string, merge: string, file: string) {
 }
 
 // --name-only lists every path both sides touched, even one git merged cleanly; the merge owns a
-// path only where its combined diff has a line of its own.
-function mergeOwnedPaths(root: string, merge: string) {
+// path only where its combined diff has a line of its own. Each of those diffs is a git process, so
+// only the changed paths get one: a merge of weeks of develop lists hundreds of files.
+function mergeOwnedPaths(root: string, merge: string, changed: Set<string>) {
   return listedPaths(root, ['diff-tree', '--cc', '-r', '--name-only', '-z', '--no-commit-id', merge])
+    .filter((file) => changed.has(file))
     .filter((file) => diffHunks(mergeDiff(root, merge, file)).some((hunk) => combinedChangedLines(hunk).length));
 }
 
-function changePaths(root: string, change: OwnChange, working: string[]) {
-  if ('merge' in change) return mergeOwnedPaths(root, change.merge);
-  return change.to ? listedPaths(root, ['diff', '--name-only', '--no-renames', '-z', change.from, change.to]) : working;
+function changePaths(root: string, change: OwnChange, working: string[], changed: Set<string>) {
+  if ('merge' in change) return mergeOwnedPaths(root, change.merge, changed);
+  const paths = change.to ? listedPaths(root, ['diff', '--name-only', '--no-renames', '-z', change.from, change.to]) : working;
+  return paths.filter((file) => changed.has(file));
 }
 
 function changeTestNames(root: string, change: OwnChange, files: string[]) {
@@ -1095,7 +1122,7 @@ function ownChangeAttribution(root: string, changes: OwnChange[], working: strin
   const owned = new Set<string>();
   const names: string[] = [];
   for (const change of changes) {
-    const files = changePaths(root, change, working).filter((file) => changed.has(file));
+    const files = changePaths(root, change, working, changed);
     files.forEach((file) => owned.add(file));
     names.push(...changeTestNames(root, change, files));
   }
@@ -1127,11 +1154,12 @@ function negativeControlChanges(slug: any, ticket: any, delta: any, changedPaths
 }
 
 // diff-tree prints nothing for a merge, so the committed paths miss a file that only a merge's
-// conflict resolution or hand edit changed.
+// conflict resolution or hand edit changed. Only the first-parent line holds the candidate's own
+// merges; a merge develop made internally and the candidate only inherited sits off it.
 function mergeResolvedPaths(workspace: any): string[] {
   if (!workspace?.base) return [];
   try {
-    return listedPaths(workspace.root, ['log', '--merges', '--format=', '--cc', '--name-only', '-z', `${workspace.base}..HEAD`]);
+    return listedPaths(workspace.root, ['log', '--merges', '--first-parent', '--format=', '--cc', '--name-only', '-z', `${workspace.base}..HEAD`]);
   } catch (_: any) {
     return [];
   }
@@ -1338,7 +1366,7 @@ function completionWorkFacts(slug: string, ticket: ProvenanceCompletionTicket): 
   const changedPaths: string[] = Array.from(new Set<string>([...delta.working, ...delta.committed, ...mergeResolvedPaths(delta.workspace)]))
     .filter(file => commitScope.isInScope(file, declaredFiles)).sort();
   try {
-    const ownedPaths = ownedWorkPaths(delta.workspace.root, state.workProvenance, changedPaths, ref => getTicket(slug, ref));
+    const ownedPaths = ownedWorkPaths(delta.workspace.root, state.workProvenance, changedPaths, ref => getTicket(slug, ref), ticket.ref);
     return { ok: true, applicable: true, declaredFiles, changedPaths, ownedPaths, delta, provenance: state.workProvenance };
   } catch (error) {
     return { ok: false, reason: 'work_provenance_mismatch', message: error instanceof Error ? error.message : String(error) };
@@ -1570,6 +1598,11 @@ const { admitComposition, withCompositionDispatchPreparation, withCompositionGen
 
 const { correctAcceptedReviewVerdict } = createReviewCorrections({
   getTicket, pendingSubmission: pendingSubmissionForTickets, isReadOnlyExecutor, submissionReviewRelation,
+  withSourceTicketLock, withTicketLock, createComment, recordBoundReviewOutcome, putTicket, invalidateStoreCaches,
+});
+
+const { finalizeCompletedReview } = createReviewFinalization({
+  getTicket, pendingSubmission: pendingSubmissionForTickets, submissionReviewRelation,
   withSourceTicketLock, withTicketLock, createComment, recordBoundReviewOutcome, putTicket, invalidateStoreCaches,
 });
 
@@ -4651,6 +4684,7 @@ module.exports = {
   ticketRecordedCommits,
   deleteProjectExact,
   mergeProject,
+  moveProject,
   setProjectNotify,
   setProjectRouting,
   projectRoutingEnabled,
@@ -4664,6 +4698,7 @@ module.exports = {
   appendExperimentEntry,
   applyExperimentVerdict,
   correctAcceptedReviewVerdict,
+  finalizeCompletedReview,
   admitComposition,
   appendOverturnLine,
   experimentPacket,

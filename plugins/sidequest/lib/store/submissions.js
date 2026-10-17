@@ -1,12 +1,14 @@
 "use strict";
-const { classifyVerificationKind, commandVerificationResult, verificationAccepted, verificationFailureDiagnostic, verificationOutcome, verificationRequirement, validateVerificationWaiver, verificationWaiverDiagnostic } = require("../kernel/verification.js");
+const { currentBoardPath } = require("./move.js");
+"use strict";
+const { classifyVerificationKind, commandVerificationResult, verificationAccepted, verificationFailureDiagnostic, verificationOutcome, verificationRequirement, validateVerificationWaiver, verificationWaiverDiagnostic, verifyCwdForRequirement } = require("../kernel/verification.js");
 const { runProcessVerification } = require("../ports/process.js");
 const { readLockHolder } = require("./locks.js");
 const { isFullSuiteCommand, runFullSuiteVerification } = require("../verify-capture.js");
 const { worktreeSetupDeadlineMs } = require("../hook-timeouts.js");
 const { decideSubmissionAdmission } = require("../kernel/submission");
 const { isSourceRevisionAdapterFacts, sourceRevisionBaseline } = require("../source-revision-capability.js");
-const { reviewCandidateFromSubmission, reviewRelationFor, reviewRelationRef, reviewRelationOutcome, reviewLockMessage, reviewProvenance } = require("../kernel/review-binding");
+const { reviewCandidateFromSubmission, reviewRelationFor, reviewRelationRef, reviewRelationOutcome, reviewLockMessage, reviewProvenance, mainAttestedReviewOutcome } = require("../kernel/review-binding");
 const { assembleWave, openWave, recordAssembledWaveGate, recordWaveDelivery } = require("../kernel/wave");
 const { isInScope, scopedPaths } = require("../scope-match");
 const { manualCandidateDeliveryGuidance, candidateReviewRequiredGuidance, applyDeliveryContentCommitGuidance, landedWithoutSubmissionGuidance } = require("../refusal-guidance.js");
@@ -148,9 +150,14 @@ function createSubmissions(dependencies) {
       message: reviewLockMessage(operation, ticket, relation)
     };
   }
+  function completedBoundReview(ticket, relation) {
+    const review = relation.reviewTicket;
+    if (!review) return false;
+    return [!relation.conflict, review.status === "done" || mainAttestedReviewOutcome(ticket, review) === "accepted"].every(Boolean);
+  }
   function terminalReviewFailure(ticket, relation) {
     const reviewTicket = relation.reviewTicket;
-    if (relation.conflict || !reviewTicket || reviewTicket.status !== "done") {
+    if (!completedBoundReview(ticket, relation)) {
       return `${reviewRelationRef(relation)} has not terminally completed its bound review of ${ticket.ref}`;
     }
     const target = reviewTicket.reviewTarget;
@@ -158,6 +165,7 @@ function createSubmissions(dependencies) {
     if (target?.ticketId !== ticket.id || target?.candidate?.source !== submitted?.source || target?.candidate?.value !== submitted?.value) {
       return `${reviewRelationRef(relation)} is not the review of this exact candidate`;
     }
+    if (mainAttestedReviewOutcome(ticket, reviewTicket) === "accepted") return null;
     const provenance = reviewProvenance(ticket, reviewTicket);
     if (provenance.reason === "source_attempt_missing") {
       return `${ticket.ref} has no terminal dispatch attempt that submitted candidate ${submitted?.value || "under review"}`;
@@ -671,8 +679,9 @@ ${captureCommandDetails(pinnedCommand, capturedCommand)}`;
     }
     const timeoutMilliseconds = normalizeIntegrationVerifyTimeoutMs(boardConfig(slug)?.integrationVerifyTimeoutMs);
     const project = String(opts?.cwd || "").trim() || readMeta(slug)?.path;
+    const verifyCwd = verifyCwdForRequirement(requirement, ticket.executorVerifyCwd);
     const verify = (environment) => runProcessVerification(requirement, {
-      cwd: ticket.executorVerifyCwd ? path.resolve(project, ticket.executorVerifyCwd) : project,
+      cwd: verifyCwd ? path.resolve(project, verifyCwd) : project,
       timeoutMilliseconds,
       logPath: opts?.verifyLogPath || integrationVerifyLogPath(slug, ticket),
       outputTailBytes: INTEGRATION_VERIFY_OUTPUT_TAIL_BYTES,
@@ -3272,6 +3281,7 @@ ${parts.join("\n\n")}` });
     return existingGateCheckout(slug, "");
   }
   function existingGateCheckout(slug, isolatedWorktree) {
+    isolatedWorktree = currentBoardPath(readMeta(slug), isolatedWorktree);
     return { ok: true, cwd: isolatedWorktree || readMeta(slug).path, isolatedWorktree, tree: null, remove: () => {
     } };
   }
