@@ -170,7 +170,7 @@ unsupported measurement stays visible.
 
 ### Choose the planning depth
 
-A bounded fix defaults to one owner and a focused check. Small fixes in a few known files may run inline without a ticket. Read-only investigations may use native Explore or general-purpose agents without tickets. A story or wave needs 3+ independently checkable pieces and a stated reason; a review panel needs a named risk for each lens. Substantial or ambiguous work starts with a visible surgical contract: the outcome, non-goals, smallest authority needed, scope, bounded oracle (the check that decides whether it worked), and review limit. Claude settles why an improvement is worth making, its approach, and its boundary before dispatch. Research can supply facts and bounded alternatives. Executors implement that plan with normal local coding judgment and report evidence when a pinned choice cannot work.
+A bounded fix defaults to one owner and a focused check. Small fixes in a few known files may run inline without a ticket. Read-only investigations need no ticket either: on a routed project, `route_recipe(category).research` gives one read-only spawn that runs on that category's model (so codebase research and UX research can use different models). Native Explore or general-purpose agents still cover tiny lookups and unrouted projects. A story or wave needs 3+ independently checkable pieces and a stated reason; a review panel needs a named risk for each lens. Substantial or ambiguous work starts with a visible surgical contract: the outcome, non-goals, smallest authority needed, scope, bounded oracle (the check that decides whether it worked), and review limit. Claude settles why an improvement is worth making, its approach, and its boundary before dispatch. Research can supply facts and bounded alternatives. Executors implement that plan with normal local coding judgment and report evidence when a pinned choice cannot work.
 
 For substantial or safety-sensitive changes, Claude first checks feasibility before expensive coding or
 tests: shared authority and callers, the smallest existing seam, support for the project's configured quality gate, if any, genuine
@@ -271,6 +271,18 @@ Settings covers routing profiles, model fallback, theme, notification preference
 ![Sidequest settings dialog showing routing, appearance, tour, and notification controls](../../../assets/screenshots/sidequest-settings.png)
 
 *Synthetic demo data behind the Sidequest settings dialog.*
+
+## Link tickets to GitHub or Jira
+
+Tie a ticket to the issue it came from with `refs`:
+
+```text
+sidequest add -t "Fix the empty-cart total" --refs GH-123 --refs acme/shop#45 ...
+```
+
+Accepted forms are `GH-123` or `#123` (the repository needs a GitHub origin), `owner/repo#123`, a GitHub issue or pull request URL, and a Jira key such as `SHOP-123`. Jira keys only become links once you set the base URL with `sidequest board-config --jira-base-url https://team.atlassian.net`. Refs are deduplicated, `update` replaces the list, and `refs: []` clears it. Full ticket reads show the links, briefings show the keys, and a release fragment with `refs` links the issue key in the changelog bullet.
+
+To start from an existing issue, run `sidequest add --github <issue-or-pr-url>`. It reads the issue through the `gh` CLI, drops HTML comments and images from the body, and records the URL as a ref. Run `gh auth login` first if that fails. Refs only link the ticket to the issue; Sidequest does not write back to GitHub or Jira.
 
 ## Daily use
 
@@ -413,7 +425,7 @@ Ask Claude to set `deniedTools` on the board (`board_config`) or on one category
 
 **An unscoped executor could only write `docs/`.** Older builds gave a write ticket with no declared files, dispatched with `allowUnscoped`, only the board's `alwaysInScope` paths, so a repo with a `docs/` folder quietly scoped the executor to `docs/` and nothing else. Now `allowUnscoped` gives the executor the whole tree, and the dispatch result's `writeScope` and the briefing say so in one line, for example `write scope: unscoped (whole tree), always-in-scope: docs/`. A whole-tree scope needs an isolated worktree, so an unscoped dispatch that would run in the shared checkout is refused at dispatch; declare the paths the ticket needs instead.
 
-**Destructive Git is refused in a dirty shared checkout.** The refusal lists dirty paths and gives a named-stash command followed by `sidequest recover-shared`. The project path appears only in the recovery command, leaving room for that guidance under long Windows temp paths within the hook's 768-byte output budget. An unregistered evidence clone stays outside this shared-checkout guard.
+**Destructive Git is refused in a dirty shared checkout.** The refusal lists dirty paths and gives a named-stash command followed by `sidequest recover-shared`. The project path appears only in the recovery command, leaving room for that guidance under long Windows temp paths within the hook's 768-byte output budget. An unregistered evidence clone stays outside this shared-checkout guard. This guard fails closed: when it can't run its own git check, it refuses the command instead of letting a reset or push through unchecked. It only starts git once the command text names a destructive, tagging or pushing invocation, and asks each directory for its repository once per session.
 
 **A legitimate recursive delete gets refused.** Sidequest blocks a Bash or PowerShell command that recursively deletes the user profile or the `.claude` root, even inside a real cleanup. A home-relative target such as `~/repos/app/build` or `$HOME/repos/app/build` is judged by where it resolves, the same as its absolute spelling, so only the profile, `.claude`, or a parent of either is refused. Point the delete at a specific project or scratchpad path instead.
 
@@ -476,6 +488,8 @@ Ask Claude to set `deniedTools` on the board (`board_config`) or on one category
 **A candidate was rebased or squash-merged before it landed.** Its files no longer match the candidate byte for byte, and later merges keep moving them, so a plain manual delivery refuses for missing content. Ask Claude to record the delivery against the landed revision it can name — a merge commit, or whatever the upstream flow produced — and Sidequest proves every submitted path at that revision instead of your working tree: the same content, a deletion the revision also carries, or the candidate's own change reverse-applying onto it. Anything left over still refuses, and closes only once Claude names those paths as resolved by hand and the closure reason carries that evidence. A revision older than the candidate's own starting point is refused outright, because it cannot hold the landing, and naming resolved paths on a candidate the branch already contains is refused too rather than quietly ignored. The record keeps the per-path proof.
 
 **Integration stops on a merge conflict.** Sidequest never resolves a conflict itself. It aborts, puts the target back, and names the recovery: merge the candidate into the target branch by hand, resolve the conflict, commit the merge, re-run the checks, then ask Claude to record it. That is a `groomClose` with the merge commit as `deliveryCommit` and `deliveryMethod: "manual"`. Keep the candidate as a parent of that merge, because that ancestry is what proves the candidate's content landed. A squash or cherry-pick of the resolution drops it and is refused.
+
+**A submitted candidate never landed, and its prepared integration branch was deleted.** Ask Claude to close it with `groomClose`, `abandonSubmission: true`, and the reason it was discarded. Sidequest checks the current board integration target, falling back to the remote default branch if that target is unavailable. If the candidate is reachable there, closure refuses and names the ref. Otherwise it records abandonment. Delivery still requires the original frozen target to resolve.
 
 **A candidate landed through a squash merge, and closing it says it never landed.** A squash gives the work a new commit, so the candidate itself is never an ancestor of the target. Ask Claude to record the squash commit as the delivery: a `groomClose` with that commit as `deliveryCommit`. It records when the squash carries exactly the candidate's changes, whether the candidate was one commit or several. A squash that also carries another ticket's changes still refuses. Leave that ticket open rather than closing it with `abandonSubmission`, which records work that shipped as never landed.
 

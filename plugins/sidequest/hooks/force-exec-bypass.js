@@ -354,8 +354,8 @@ function enclosingCheckout(start) {
   }
 }
 
-// src/hooks/shared/read-only-shell.ts
-var SHELL_TOKEN_RE = /((?:\d|&)?>>?(?:&\d?)?|&&|\|\||[|;\n])|(@"\r?\n[\s\S]*?\r?\n"@|@'\r?\n[\s\S]*?\r?\n'@|"(?:[^"\\`]|[\\`][\s\S]|"")*"|'(?:[^']|'')*'|[^\s|;&<>"']+)/g;
+// src/hooks/shared/shell-writes.ts
+var SHELL_TOKEN_RE = /(@"\r?\n[\s\S]*?\r?\n"@|@'\r?\n[\s\S]*?\r?\n'@|"(?:[^"\\`]|[\\`][\s\S]|"")*"|'(?:[^']|'')*')|((?:\d|&)?>>?(?:&\d?)?|&&|\|\||[|;\n])|([^\s|;&<>"']+)/g;
 var SEGMENT_OPERATORS = /* @__PURE__ */ new Set(["&&", "||", "|", ";", "\n"]);
 var NULL_SINKS = /* @__PURE__ */ new Set(["/dev/null", "nul", "$null"]);
 var MUTATING_GIT = /* @__PURE__ */ new Set([
@@ -387,8 +387,11 @@ function gitWriteTargets(words) {
   const subcommand = operands(words).find((word) => word !== directory);
   return MUTATING_GIT.has(String(subcommand)) ? [directory || "."] : [];
 }
+var SED_SCRIPT_FLAGS = /* @__PURE__ */ new Set(["-e", "--expression", "-f", "--file"]);
 function inPlaceEditTargets(words) {
-  return words.some((word) => /^-[a-z]*i/i.test(word)) ? operands(words).slice(1) : [];
+  if (!words.some((word) => /^-[a-z]*i/i.test(word))) return [];
+  const fileOperands = words.slice(1).filter((word, index, rest) => word && !word.startsWith("-") && !SED_SCRIPT_FLAGS.has(rest[index - 1] ?? ""));
+  return words.some((word) => SED_SCRIPT_FLAGS.has(word)) ? fileOperands : fileOperands.slice(1);
 }
 function contentCmdletTargets(words) {
   const pathFlag = words.findIndex((word) => /^-(path|literalpath|filepath)$/i.test(word));
@@ -426,18 +429,17 @@ var WRITE_TARGET_READERS = new Map([
   ["git", gitWriteTargets]
 ]);
 function commandName(words) {
-  return import_node_path4.default.basename(words[0] || "").toLowerCase().replace(/\.exe$/, "");
+  return (words[0] || "").split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, "");
 }
 function isGitMutation(words) {
   return commandName(words) === "git" && gitWriteTargets(words).length > 0;
 }
 function commandWriteTargets(words) {
-  const name = commandName(words);
-  const reader = WRITE_TARGET_READERS.get(name);
+  const reader = WRITE_TARGET_READERS.get(commandName(words));
   return reader ? reader(words) : [];
 }
 function shellTokens(command) {
-  return [...command.matchAll(SHELL_TOKEN_RE)].map((match) => match[1] ? { operator: match[1] } : { word: match[2].replace(/^(["'])([\s\S]*)\1$/, "$2") });
+  return [...command.matchAll(SHELL_TOKEN_RE)].map((match) => match[2] ? { operator: match[2] } : { word: (match[1] || match[3]).replace(/^(["'])([\s\S]*)\1$/, "$2") });
 }
 function shellSegments(command) {
   const segments = [{ words: [], redirects: [] }];
@@ -458,6 +460,8 @@ function shellSegments(command) {
 function ignoredTarget(word) {
   return !word || word.startsWith("$") || NULL_SINKS.has(word.toLowerCase());
 }
+
+// src/hooks/shared/read-only-shell.ts
 function nativePath(word) {
   if (word === "~" || word.startsWith("~/")) return import_node_path4.default.join(import_node_os2.default.homedir(), word.slice(1));
   return process.platform === "win32" ? word.replace(/^\/([a-z])(\/|$)/i, "$1:/") : word;
@@ -507,6 +511,62 @@ function readOnlyShellRefusal(command, cwd) {
   }
   const blocked = firstCheckoutWrite(command, cwd);
   return blocked ? `sidequest: read-only executor, refusing a shell write inside the repository checkout (${blocked}). Use scratch files outside the checkout, under ${import_node_os2.default.tmpdir()}, or the ticket's verification directory. For repository edits, comment the needed change and release the ticket.` : null;
+}
+
+// src/hooks/shared/main-thread-mutations.ts
+var CLOSEOUT_UPDATE_FIELDS = /* @__PURE__ */ new Set([
+  "files",
+  "addFiles",
+  "removeFiles",
+  "status",
+  "readonly",
+  "readonlyOverride",
+  "workingTreeDelivery",
+  "externalDeliverable",
+  "verify",
+  "verifyKind",
+  "attestationArtifact",
+  "verifyCwd",
+  "admitComposition",
+  "executorVerify",
+  "executorVerifyKind",
+  "executorAttestationArtifact",
+  "executorVerifyCwd"
+]);
+var MAIN_THREAD_MUTATIONS = {
+  mcp__plugin_sidequest_board__dispatch: {
+    matches: (input) => Object.hasOwn(input, "workProvenance"),
+    denial: "sidequest: subagents cannot declare work provenance. Ask the main thread to freeze source-bound factual provenance before dispatch; actor labels and shared session ids grant nothing."
+  },
+  mcp__plugin_sidequest_board__update: {
+    matches: (input) => Array.from(CLOSEOUT_UPDATE_FIELDS).some((field) => Object.hasOwn(input, field)),
+    denial: "sidequest: subagents cannot update closeout fields or admit a composition through MCP. Use scopeRequest for files, or ask the orchestrator to set closeout fields or use update.admitComposition from the main thread."
+  },
+  mcp__plugin_sidequest_board__scopeRequest: {
+    // scopeRequest with grant:true widens declaredFiles for a refusal the ticket
+    // already recorded, which is a live-claim mutation just like the update fields
+    // above. Without this, a subagent could pass by:'orchestrator' to mint the
+    // grant itself; the store's by-mismatch check only catches the claim holder's
+    // own by, not an impersonated one.
+    matches: (input) => input.grant === true,
+    denial: "sidequest: subagents cannot grant a refused scope request through MCP. Ask the orchestrator to grant it from the main thread."
+  },
+  mcp__plugin_sidequest_board__remove: {
+    // force:true is the only path that deletes a live-claimed ticket, so it is the
+    // executor's escape hatch (delete the ticket to shed the claim). The store
+    // refuses ungranted live-claim deletion, but deny it here too so a subagent
+    // can never mint the main-thread grant by riding the MCP remove handler.
+    matches: (input) => input.force === true,
+    denial: "sidequest: subagents cannot force-remove a ticket. Release your claim, or ask the orchestrator to remove it from the main thread."
+  },
+  mcp__plugin_sidequest_board__verdict: {
+    matches: (input) => ["correct", "finalize"].some((field) => Object.hasOwn(input, field)),
+    denial: "sidequest: subagents cannot finalize or correct completed review verdicts. Ask the orchestrator to use verdict with finalize or correct from the main thread."
+  }
+};
+function mainThreadMutationDenial(toolName, toolInput) {
+  const rule = MAIN_THREAD_MUTATIONS[toolName];
+  return rule?.matches(toolInput) ? rule.denial : null;
 }
 
 // src/lib/board-mcp-liveness.ts
@@ -1007,64 +1067,12 @@ function dispatchLaunches(prompt) {
 function toolInputOf(input) {
   return isRecord(input.tool_input) ? input.tool_input : null;
 }
-var CLOSEOUT_UPDATE_FIELDS = /* @__PURE__ */ new Set([
-  "files",
-  "addFiles",
-  "removeFiles",
-  "status",
-  "readonly",
-  "readonlyOverride",
-  "workingTreeDelivery",
-  "externalDeliverable",
-  "verify",
-  "verifyKind",
-  "attestationArtifact",
-  "verifyCwd",
-  "admitComposition",
-  "executorVerify",
-  "executorVerifyKind",
-  "executorAttestationArtifact",
-  "executorVerifyCwd"
-]);
-var MAIN_THREAD_MUTATIONS = {
-  mcp__plugin_sidequest_board__dispatch: {
-    matches: (input) => Object.hasOwn(input, "workProvenance"),
-    denial: "sidequest: subagents cannot declare work provenance. Ask the main thread to freeze source-bound factual provenance before dispatch; actor labels and shared session ids grant nothing."
-  },
-  mcp__plugin_sidequest_board__update: {
-    matches: (input) => Array.from(CLOSEOUT_UPDATE_FIELDS).some((field) => Object.hasOwn(input, field)),
-    denial: "sidequest: subagents cannot update closeout fields or admit a composition through MCP. Use scopeRequest for files, or ask the orchestrator to set closeout fields or use update.admitComposition from the main thread."
-  },
-  mcp__plugin_sidequest_board__scopeRequest: {
-    // scopeRequest with grant:true widens declaredFiles for a refusal the ticket
-    // already recorded, which is a live-claim mutation just like the update fields
-    // above. Without this, a subagent could pass by:'orchestrator' to mint the
-    // grant itself; the store's by-mismatch check only catches the claim holder's
-    // own by, not an impersonated one.
-    matches: (input) => input.grant === true,
-    denial: "sidequest: subagents cannot grant a refused scope request through MCP. Ask the orchestrator to grant it from the main thread."
-  },
-  mcp__plugin_sidequest_board__remove: {
-    // force:true is the only path that deletes a live-claimed ticket, so it is the
-    // executor's escape hatch (delete the ticket to shed the claim). The store
-    // refuses ungranted live-claim deletion, but deny it here too so a subagent
-    // can never mint the main-thread grant by riding the MCP remove handler.
-    matches: (input) => input.force === true,
-    denial: "sidequest: subagents cannot force-remove a ticket. Release your claim, or ask the orchestrator to remove it from the main thread."
-  },
-  mcp__plugin_sidequest_board__verdict: {
-    matches: (input) => ["correct", "finalize"].some((field) => Object.hasOwn(input, field)),
-    denial: "sidequest: subagents cannot finalize or correct completed review verdicts. Ask the orchestrator to use verdict with finalize or correct from the main thread."
-  }
-};
 function executorLiveClaimMutationRefusal(input) {
   if (!isSubagentCaller(input)) return false;
   const toolInput = toolInputOf(input);
-  if (!toolInput) return false;
-  const rule = MAIN_THREAD_MUTATIONS[stringField(input, "tool_name")];
-  if (!rule) return false;
-  if (!rule.matches(toolInput)) return false;
-  writeDeny("PreToolUse", rule.denial);
+  const denial = toolInput && mainThreadMutationDenial(stringField(input, "tool_name"), toolInput);
+  if (!denial) return false;
+  writeDeny("PreToolUse", denial);
   return true;
 }
 function dispatchAgentName(input) {
@@ -1633,11 +1641,56 @@ function refusedGenericAgent({ input, type, classification }) {
   writeDeny("PreToolUse", agentDenyReason(input, type, classification));
   return true;
 }
+var RESEARCH_KINDS = /* @__PURE__ */ new Set(["read_only_codex_dispatch", "read_only_claude_builtin"]);
+function categoryResearchSpawn(store, researchSpawnFor, category) {
+  const route = store.resolveCategoryRoute(category);
+  return route?.exec ? researchSpawnFor(route.exec, route.effort) : null;
+}
+function liveResearchSpawns(input) {
+  try {
+    const store = require(runtimeModule("store"));
+    const { researchSpawn } = require(runtimeModule("agentsync"));
+    const found = store.findProject(requestedProject(input));
+    if (!found.ok || !found.slug) return [];
+    return store.getCategories({ project: found.slug }).filter((category) => category.enabled).map((category) => categoryResearchSpawn(store, researchSpawn, category)).filter((spawn) => spawn !== null);
+  } catch (_) {
+    return [];
+  }
+}
+function matchingResearchSpawn({ input, toolInput, type }) {
+  const prompt = String(toolInput.prompt ?? "");
+  if (dispatchRouteMarkers(input).length !== 1) return void 0;
+  return liveResearchSpawns(input).find((spawn) => canonicalExecutorName(spawn.subagentType) === type && prompt.startsWith(spawn.promptPrefix.trimEnd()));
+}
+function researchSpawnInput(toolInput, research) {
+  const updatedInput = { ...toolInput };
+  delete updatedInput.mode;
+  delete updatedInput.isolation;
+  delete updatedInput.model;
+  if (research.model) updatedInput.model = research.model;
+  return updatedInput;
+}
+function isResearchAttempt({ toolInput, classification }, dispatchValidation) {
+  return dispatchValidation.status === "none" && RESEARCH_KINDS.has(classification.kind) && String(toolInput.prompt ?? "").startsWith("[sidequest-route ");
+}
+function decidedResearchSpawn(request, dispatchValidation) {
+  if (!isResearchAttempt(request, dispatchValidation)) return false;
+  const research = matchingResearchSpawn(request);
+  if (!research) {
+    writeDeny("PreToolUse", `sidequest: ${request.type} research prompt does not open with the live research prefix of an enabled category route. Re-fetch route_recipe(category).research and spawn its subagentType, model and promptPrefix unchanged.`);
+    return true;
+  }
+  if (!refusedSubagentModelOverride()) writeToolUpdate(researchSpawnInput(request.toolInput, research));
+  return true;
+}
+function decidedBeforeExecutorLaunch(request, dispatchValidation) {
+  return decidedResearchSpawn(request, dispatchValidation) || refusedPreparedDispatch(request, dispatchValidation) || refusedGenericAgent(request) || refusedSubagentModelOverride();
+}
 function routedExecutorSpawn(request) {
   const admission = dispatchAdmission(request.input);
   if (refusedForMissingExecutorRoute(request.type, request.classification, admission)) return null;
   const dispatchValidation = preparedDispatchValidation(request.input);
-  if (refusedPreparedDispatch(request, dispatchValidation) || refusedGenericAgent(request) || refusedSubagentModelOverride()) return null;
+  if (decidedBeforeExecutorLaunch(request, dispatchValidation)) return null;
   return { ...request, admission, preparedSpawn: dispatchValidation.spawn };
 }
 function admittedExecutorSpawn(input) {
@@ -1757,6 +1810,7 @@ function main() {
 }
 try {
   main();
-} catch (_) {
-  process.exit(0);
+} catch (error) {
+  process.stderr.write(String(error));
+  process.exit(1);
 }

@@ -1,7 +1,61 @@
 ---
 title: Quality Gate
-description: Run a per-project CRAP gate with AST-backed JavaScript and TypeScript scoring.
+description: Install Quality Gate once and get a quality persona, a turn-end complexity line and a measured review, with no config.
 ---
+
+Quality Gate keeps new code small, reused and tested. It works the moment it is installed: no config file, no setup question.
+
+## Install
+
+```text
+/plugin marketplace add Eigenwise/eigenwise-toolshed
+/plugin install quality-gate@eigenwise-toolshed
+```
+
+Node 22.5+ and npm are required. The first run installs the TypeScript parser into the plugin by itself; offline, it stops with the one `npm install --prefix <plugin root>` command to run by hand.
+
+## What happens in the first session
+
+- **Persona.** Claude gets a short quality brief: intent-revealing names, no needless code, reuse before writing, and a CRAP score below 6 for new and raised functions. It also sees a list of the definitions already in your project so it can reuse them. The same text reaches executors and subagents.
+- **Band line.** Above the prompt, one line shows session cost, the highest function complexity this turn, and the last test result, for example `$0.42 · CC 4 ok · tests pass`. `SPLIT n` appears when `n` new or complexity-raised functions reached complexity 6 or more.
+- **Turn-end measurement.** After each turn that edited code, Quality Gate measures the changed functions once. It scores measured CRAP, not a regex over the text.
+- **One notice.** Without a coverage report it measures complexity only and says `quality-gate: complexity only, coverage not set up` once per session.
+
+## Review
+
+`/quality-gate:review` reviews your current diff. `/quality-gate:review repo` audits the repository, capped at 20 findings, and `/quality-gate:review debt` lists shortcut markers and the latest receipt. It reads callers and reuse signals, uses existing coverage only, and never runs your tests unasked.
+
+## Switches
+
+- `/quality-gate off` and `/quality-gate on` turn the persona off and on. On is the default.
+- `/quality-gate markers off` moves shortcut notes from source comments to the end of Claude's reply. `markers on` is the default.
+- `/quality-gate status` prints both.
+
+The choices persist across sessions.
+
+## Upgrade to measured coverage
+
+Complexity alone catches big functions. Coverage lets the gate tell a big, well-tested function from a big, untested one. Write an LCOV report to `coverage/lcov.info` and Quality Gate picks it up. Produce it with your stack's tool:
+
+| Stack | Command |
+| --- | --- |
+| JavaScript / TypeScript | `c8 --reporter=lcov npm test` |
+| Python | `coverage run -m pytest && coverage lcov -o coverage/lcov.info` |
+| Go | `go test -coverprofile=coverage.out ./... && gcov2lcov -infile coverage.out -outfile coverage/lcov.info` |
+| Rust | `cargo llvm-cov --lcov --output-path coverage/lcov.info` |
+| C / C++ | `gcovr --lcov coverage/lcov.info` |
+| PHP | `vendor/bin/phpunit --coverage-clover coverage/clover.xml && vendor/bin/clover-to-lcov coverage/clover.xml -o coverage/lcov.info` |
+| Ruby | `simplecov-lcov` with `single_report_path = 'coverage/lcov.info'`, then your normal test command |
+
+Java, Kotlin and C# need a conversion step. `/quartermaster:setup` knows those recipes and can wire a coverage command into the project for you.
+
+## If you use ponytail
+
+Quality Gate and ponytail each inject a persona, and the two disagree on the test bar and on where a known shortcut gets recorded. Pick one. Uninstall ponytail when you install Quality Gate.
+
+## Reference
+
+The sections below cover the `crap` command, its configuration and its receipts.
 
 Quality Gate scores runtime function bodies with their measured test coverage. Run its project command from an installed plugin:
 
@@ -19,7 +73,7 @@ The gate enforces CRAP strictly below 6 for every new or complexity-raised owned
 
 The CRAP report also prints informational reuse signals after scored rows, including with `--cc-only`. `DUPLICATE? name ≈ other (file:line)` means a new body shares a name (ignoring case, underscores and hyphens) with a top-level JS/TS/Python definition in another source file at HEAD. `CALLERS OPEN name: file:line` lists up to two remaining call sites outside a removed body's old file. Removal uses the existing baseline/body pairing, including deleted files within the selected scope. Tests, fixtures, vendored and generated paths are skipped. These are regex/name checks: nested definitions are missed, and a same-named call in another module can count. They never change the verdict, exit code or receipts. JSON reports put the rows under `signals`; the summary includes the reuse-signal count.
 
-Use `coverageCommand` to capture fresh LCOV while source hashes stay fixed. It gets an empty `QUALITY_GATE_COVERAGE_DIR` (also exposed as `QUARTERMASTER_COVERAGE_DIR`) for its `lcov.info`. `$VAR`, `${VAR}` and `%VAR%` in the command are expanded before it runs, on every platform, so `--reports-dir "$QUALITY_GATE_COVERAGE_DIR"` works under Windows cmd.exe too. Explicit CLI `--lcov` overrides isolated output and config. Otherwise fresh isolated output wins over config `lcov`, which is a fallback (default `coverage/lcov.info`). Without a command, the CLI path, configured path or default is read in that order. A command must rewrite any existing explicit or fallback output it uses. Missing or invalid selected output stays unverified, without silently selecting stale coverage. Existing LCOV needs a matching `<lcov>.sources.json` SHA-256 map saved at coverage capture. Source hashes alone do not prove executable-line completeness. JS/TS LCOV currently has no supported independent executable-line inventory, so those rows stay UNVERIFIED. Supported JS/TS bodies can use the existing `measure` entry with genuine same-session V8 capture. Raw V8 capture from vite-node does not identify source modules.
+Use `coverageCommand` to capture fresh LCOV while source hashes stay fixed. It gets an empty `QUALITY_GATE_COVERAGE_DIR` (also exposed as `QUARTERMASTER_COVERAGE_DIR`) for its `lcov.info`. `$VAR`, `${VAR}` and `%VAR%` in the command are expanded before it runs, on every platform, so `--reports-dir "$QUALITY_GATE_COVERAGE_DIR"` works under Windows cmd.exe too. Explicit CLI `--lcov` overrides isolated output and config. Otherwise fresh isolated output wins over config `lcov`, which is a fallback (default `coverage/lcov.info`). Without a command, the CLI path, configured path or default is read in that order. A command must rewrite any existing explicit or fallback output it uses. Missing or invalid selected output stays unverified, without silently selecting stale coverage. Existing LCOV needs a matching `<lcov>.sources.json` SHA-256 map saved at coverage capture. Source hashes alone do not prove executable-line completeness. JS/TS rows are measured against an executable-line inventory from the TypeScript AST: the start line of each statement a body owns, excluding nested bodies, decorators and type-only declarations. Every inventoried line needs a DA record, so c8 or Istanbul LCOV works. A missing record, two bodies sharing an executable line, or an empty body stays UNVERIFIED. Lizard adapters have no such inventory and stay UNVERIFIED. JS/TS bodies can also use the `measure` entry with genuine same-session V8 capture. Raw V8 capture from vite-node does not identify source modules.
 
 `--source <path>` narrows configured or default sources for one run without changing config. Repeat it for multiple files or directories, relative to the measured project root, for example `crap --project <root> --source src/changed.py --source src/other.py --cc-only`. Config exclusions still apply; selectors cannot widen configured sources.
 

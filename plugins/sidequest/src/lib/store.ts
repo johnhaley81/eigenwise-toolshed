@@ -58,6 +58,7 @@ const { canonicalPreparedDispatchExecutor, normalizePreparedDispatch } = require
 const { assertSidequestInstall, checkSidequestInstall, servingSidequestInstall, assertDispatchTransport, ensurePythonIoEncoding, localAheadOfUpstreamWarning } = require('./dispatch-preflight.js');
 const { prepareAttempt, prepareDirectAttempt, transitionAttempt, attemptDiagnostic, VERIFICATION_KINDS } = require('./kernel/index.js');
 const { createAssets } = require('./store/assets.js');
+const { createDispatchSnapshot } = require('./store/dispatch-snapshot.js');
 const { createNotifications } = require('./store/notifications.js');
 const { createWorkers } = require('./store/workers.js');
 const { createStories } = require('./store/stories.js');
@@ -1697,6 +1698,7 @@ const {
   recordSubmissionWaveDelivery,
   submissionsPayload,
 } = createSubmissions({
+  afterCommit,
   EXECUTOR_VERIFY_MAX,
   INTEGRATION_VERIFY_OUTPUT_TAIL_BYTES,
   MANUAL_VERIFY_PREFIX,
@@ -1962,8 +1964,35 @@ function ticketStorageRow(slug?: any, ticket?: any) {
   };
 }
 
+const { writeDispatchSnapshot } = createDispatchSnapshot({
+  listTickets: (slug: string) => listTickets(slug),
+  projectDir: (slug: string) => projectDir(slug),
+  boardConfig: (slug: string) => boardConfig(slug),
+  getCategory: (id: string, options: { project: string }) => getCategory(id, options),
+  routed: (slug: string) => projectDispatchAdmission(slug).status === 'routed',
+});
+
+// Every dispatch prepare, bind, claim, release, submit, done and remove writes its ticket here, so this is
+// the one seam that keeps the hooks module's dispatch snapshot current. A failed side write leaves the
+// guards reading an older snapshot; they fail open, so it must never fail the board write that caused it.
+function scheduleDispatchSnapshot(slug: string) {
+  afterCommit(() => {
+    try { writeDispatchSnapshot(slug); } catch {}
+  });
+}
+
+// Routing and denied-tools settings are snapshot fields too, so the writes that change them refresh it.
+function refreshingDispatchSnapshot(write: (slug: string, ...rest: any[]) => any) {
+  return (slug: string, ...rest: any[]) => {
+    const result = write(slug, ...rest);
+    scheduleDispatchSnapshot(slug);
+    return result;
+  };
+}
+
 function putTicket(slug?: any, ticket?: any) {
   putCachedRow(database(), 'tickets', ticketStorageRow(slug, ticket));
+  if (ticket?.dispatch) scheduleDispatchSnapshot(slug);
   const project = readMeta(slug);
   telemetry.emitTicket({ slug, path: project && project.path }, applyDerivedRouting(Object.assign({}, ticket), { project: slug }));
 }
@@ -3861,7 +3890,7 @@ function deliveredReleasePaths(repo: string, delivery: any) {
 }
 
 function missingReleaseFragmentMessage(ref?: any, fragmentPath?: any, plugins?: any) {
-  return `submit: refused ${ref}; submitted range changes shipped plugin paths (${plugins.map((plugin: any) => plugin.source).join(', ')}) but does not include ${fragmentPath}. Write the fragment, then commit it, then submit again. Next time write it BEFORE your first commit so it rides along:\n---\nref: ${ref}\ntitle: <short user-facing title>\nbump: patch\nplugins:\n${plugins.map((plugin: any) => `  - ${plugin.name}`).join('\n')}\n---\n\nDescribe the user-facing change.`;
+  return `submit: refused ${ref}; submitted range changes shipped plugin paths (${plugins.map((plugin: any) => plugin.source).join(', ')}) but does not include ${fragmentPath}. Write the file, then commit it, then submit again. Next time write it BEFORE your first commit so it rides along:\n---\nref: ${ref}\ntitle: <short user-facing title>\nbump: patch\nplugins:\n${plugins.map((plugin: any) => `  - ${plugin.name}`).join('\n')}\n---\n\nDescribe the user-facing change.`;
 }
 
 // Only reachable when a dispatch exists and recording still failed. A directly-claimed ticket has no
@@ -3888,6 +3917,31 @@ function ticketIntegrationTarget(slug?: any, ticket?: any) {
   return integrationTarget(slug, ticket?.dispatch?.integrationTarget || undefined);
 }
 
+function abandonmentFallbackTarget(slug: string) {
+  try {
+    return integrationTarget(slug);
+  } catch {
+    const upstream = execFileSync('git', ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], {
+      cwd: readMeta(slug).path, encoding: 'utf8', windowsHide: true, stdio: 'pipe',
+    }).trim();
+    return integrationTarget(slug, { mode: 'remote', branch: upstream.slice('origin/'.length) });
+  }
+}
+
+function groomingIntegrationTarget(slug: string, ticket: { submission?: object }, abandonSubmission: boolean) {
+  try {
+    return ticketIntegrationTarget(slug, ticket);
+  } catch (error) {
+    if (!abandonSubmission) throw error;
+    const target = abandonmentFallbackTarget(slug);
+    const landed = commitScope.submissionLandedIntegrationRef(readMeta(slug).path, ticket.submission, commitScope.integrationTargetRefs(target));
+    if (landed) {
+      throw new Error('Candidate already landed on ' + landed.ref + '; abandonment refused after the frozen integration target disappeared.');
+    }
+    return target;
+  }
+}
+
 function ticketIntegrationTargets(slug?: any, tickets?: any) {
   const participants = Array.isArray(tickets) ? tickets : [tickets];
   const resolved = participants.map((ticket) => ({
@@ -3895,15 +3949,26 @@ function ticketIntegrationTargets(slug?: any, tickets?: any) {
     target: ticketIntegrationTarget(slug, ticket),
   }));
   const first = resolved[0]?.target;
-  if (!first || resolved.some(({ target }) => target.mode !== first.mode || target.branch !== first.branch || target.upstream !== first.upstream)) {
+  if (!first || resolved.some(({ target }) => target.branch !== first.branch)) {
     return {
       ok: false,
       reason: 'integration_target_mismatch',
       targets: resolved,
-      message: `Wave delivery requires one recorded ticket delivery target; received ${resolved.map(({ ref, target }) => `${ref}=${target.mode}:${target.upstream}`).join(', ')}. Split the refs by target before assembly or delivery.`,
+      message: `Wave delivery requires one recorded ticket delivery branch; received ${resolved.map(({ ref, target }) => `${ref}=${target.mode}:${target.upstream}`).join(', ')}. Integrate each branch's refs as their own wave, or redispatch the refs on another branch with integrationBranch ${first?.branch || '<branch>'} so they share one.`,
     };
   }
-  return { ok: true, target: first, targets: resolved };
+  return { ok: true, target: sameBranchWaveTarget(slug, resolved.map(({ target }) => target)), targets: resolved };
+}
+
+// GH-567: auto dispatch freezes local:<branch> only while the local branch is ahead of
+// origin/<branch>, so siblings dispatched minutes apart can record either form of one
+// branch. The wave takes the form dispatch would pick now: local while it is ahead, so
+// its tip contains every sibling's base, and the remote-tracking ref otherwise.
+function sameBranchWaveTarget(slug: any, targets: any[]) {
+  const local = targets.find((target) => target.mode === 'local');
+  const remote = targets.find((target) => target.mode === 'remote');
+  if (!local || !remote) return targets[0];
+  return localAheadOfUpstreamWarning(readMeta(slug)?.path || '', local.branch) ? local : remote;
 }
 
 // The dispatch-time branch stays the default target, but an integrator that has since
@@ -4175,7 +4240,7 @@ function completeTicketAsControlPlane(slug?: any, idOrRef?: any, opts?: any) {
   if (purpose === 'grooming' && pendingSubmission(ticket)) {
     let target: any;
     try {
-      target = ticketIntegrationTarget(slug, ticket);
+      target = groomingIntegrationTarget(slug, ticket, opts.abandonSubmission === true);
     } catch (error: any) {
       return { ok: false, reason: 'integration_target_unavailable', ticket, message: String(error?.message || error) };
     }
@@ -4621,7 +4686,7 @@ module.exports = {
   promoteRoutingProfile,
   getRoutingProfile,
   projectRoutingProfile,
-  setProjectRoutingProfile,
+  setProjectRoutingProfile: refreshingDispatchSnapshot(setProjectRoutingProfile),
   setNewProjectRoutingProfile,
   routingProfileEntries,
   routingProfileCategory,
@@ -4631,9 +4696,9 @@ module.exports = {
   getCategoryRoutePairs,
   getCategory,
   getProjectCategories,
-  setProjectCategory,
+  setProjectCategory: refreshingDispatchSnapshot(setProjectCategory),
   detachCategory,
-  removeProjectCategory,
+  removeProjectCategory: refreshingDispatchSnapshot(removeProjectCategory),
   setCategory,
   removeCategory,
   homeRoot,
@@ -4649,7 +4714,7 @@ module.exports = {
   sourceRevisionAdapterFacts,
   readMeta,
   boardConfig,
-  setBoardConfig,
+  setBoardConfig: refreshingDispatchSnapshot(setBoardConfig),
   integrationTarget,
   ticketIntegrationTarget,
   ticketIntegrationTargets,
@@ -4686,7 +4751,7 @@ module.exports = {
   mergeProject,
   moveProject,
   setProjectNotify,
-  setProjectRouting,
+  setProjectRouting: refreshingDispatchSnapshot(setProjectRouting),
   projectRoutingEnabled,
   copyAsset,
   saveAssetData,
