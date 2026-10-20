@@ -719,6 +719,22 @@ test('two runs on one checkout each read the lcov their own coverage command wro
   assert.equal(second.functions[0].coverage, 0, "the second run reads its own run's lcov");
 });
 
+test('a coverage command that prints more than the default 1 MiB spawnSync buffer still reaches the gate', () => {
+  const projectDir = fixtureProject({
+    'complexity.csv': csv([{ complexity: 1, name: 'subject', start: 1, end: 1 }]),
+  });
+  const noisy = coverageStub([
+    "fs.mkdirSync('coverage', { recursive: true });",
+    "fs.writeFileSync(path.join('coverage', 'lcov.info'), 'SF:src/app.js\\nDA:1,1\\nend_of_record\\n', 'utf8');",
+    "process.stdout.write('x'.repeat(2 * 1024 * 1024));",
+  ]);
+
+  const result = runCli(['--complexity', 'complexity.csv', '--coverage-command', noisy.command], projectDir);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /ENOBUFS/);
+});
+
 test('a coverage command that exits 0 without rewriting the default lcov exits two, and one that rewrites it passes', () => {
   const projectDir = fixtureProject({
     'complexity.csv': csv([{ complexity: 1, name: 'subject', start: 1, end: 1 }]),

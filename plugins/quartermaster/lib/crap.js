@@ -366,7 +366,7 @@ function lizardRunner() {
 }
 
 function runCoverageCommand(command, workDir, reportsDir) {
-  const result = spawnSync(command, { cwd: workDir, shell: true, encoding: 'utf8', windowsHide: true, env: { ...process.env, [COVERAGE_DIR_ENV]: reportsDir } });
+  const result = spawnSync(command, { cwd: workDir, shell: true, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, windowsHide: true, env: { ...process.env, [COVERAGE_DIR_ENV]: reportsDir } });
   if (result.error) throw new PrerequisiteError(`coverage command failed to start: ${result.error.message}`, 'check coverageCommand in the config');
   if (result.status !== 0) throw new PrerequisiteError(`coverage command exited ${result.status}: ${lastLines(result.stderr, 3)}`, 'fix the coverage command, then run the gate again');
 }
