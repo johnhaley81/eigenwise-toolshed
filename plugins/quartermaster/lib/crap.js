@@ -12,11 +12,13 @@ const DEFAULT_LCOV = 'coverage/lcov.info';
 /** A coverageCommand can write its lcov.info here instead of the shared `coverage/`, so concurrent runs on one checkout stay apart. */
 const COVERAGE_DIR_ENV = 'QUARTERMASTER_COVERAGE_DIR';
 const CONFIG_RELATIVE_PATH = path.join('.claude', 'quartermaster', 'crap.json');
-const INSTALL_HINT = 'install lizard with `uv tool install lizard`, `pipx install lizard`, or `pip install lizard`';
+/** Newer lizard releases read some TypeScript differently, so the gate runs only the version its tests were written against. */
+const LIZARD_PIN = '1.24.1';
+const INSTALL_HINT = `install lizard ${LIZARD_PIN} with \`uv tool install lizard==${LIZARD_PIN}\`, \`pipx install lizard==${LIZARD_PIN}\`, or \`pip install lizard==${LIZARD_PIN}\`; a lizard on PATH newer than ${LIZARD_PIN} is not used`;
 const LIZARD_CANDIDATES = [
-  { command: 'lizard', leading: [] },
-  { command: 'uvx', leading: ['lizard'] },
-  { command: 'pipx', leading: ['run', 'lizard'] },
+  { command: 'lizard', leading: [], onPath: true },
+  { command: 'uvx', leading: ['--from', `lizard==${LIZARD_PIN}`, 'lizard'] },
+  { command: 'pipx', leading: ['run', '--spec', `lizard==${LIZARD_PIN}`, 'lizard'] },
 ];
 const SOURCE_EXTENSIONS = new Set(['.c', '.cc', '.cpp', '.cs', '.go', '.h', '.java', '.js', '.jsx', '.kt', '.php', '.py', '.rb', '.rs', '.ts', '.tsx']);
 /**
@@ -348,20 +350,39 @@ function baselineFunctions({ projectDir, baseReference, files, exclude, runLizar
   return { base, changed, changedLines, ...index };
 }
 
-function lizardRunner() {
+function versionParts(text) {
+  const match = /(\d+)\.(\d+)\.(\d+)/.exec(text ?? '');
+  return match ? match.slice(1).map(Number) : null;
+}
+
+function newerThanPin(parts) {
+  const pin = versionParts(LIZARD_PIN);
+  return parts.reduce((order, part, index) => order || Math.sign(part - pin[index]), 0) > 0;
+}
+
+/** A lizard on PATH that reports no parseable version cannot be shown to be at or below the pin, so it is not used either. */
+function lizardCandidateAllowed(candidate, spawn = spawnSync) {
+  if (!candidate.onPath) return true;
+  const probe = spawn(candidate.command, ['--version'], { encoding: 'utf8', windowsHide: true });
+  const parts = probe.error || probe.status !== 0 ? null : versionParts(probe.stdout);
+  return parts !== null && !newerThanPin(parts);
+}
+
+function lizardRunner({ spawn = spawnSync } = {}) {
   let resolved = null;
   return ({ cwd, sources, exclude }) => {
     const tail = ['--csv', ...exclude.flatMap((pattern) => ['-x', pattern]), ...sources];
     for (const candidate of resolved ? [resolved] : LIZARD_CANDIDATES) {
+      if (!lizardCandidateAllowed(candidate, spawn)) continue;
       const label = [candidate.command, ...candidate.leading].join(' ');
-      const result = spawnSync(candidate.command, [...candidate.leading, ...tail], { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, windowsHide: true });
+      const result = spawn(candidate.command, [...candidate.leading, ...tail], { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, windowsHide: true });
       if (result.error?.code === 'ENOENT') continue;
       if (result.error) throw new PrerequisiteError(`${label} failed to start: ${result.error.message}`, INSTALL_HINT);
       if (result.status !== 0) throw new PrerequisiteError(`${label} exited ${result.status}: ${lastLines(result.stderr, 3)}`, INSTALL_HINT);
       resolved = candidate;
       return result.stdout;
     }
-    throw new PrerequisiteError('lizard is not resolvable (tried lizard, uvx lizard, pipx run lizard)', INSTALL_HINT);
+    throw new PrerequisiteError(`lizard is not resolvable (tried lizard at or below ${LIZARD_PIN}, uvx lizard==${LIZARD_PIN}, pipx run lizard==${LIZARD_PIN})`, INSTALL_HINT);
   };
 }
 
@@ -718,4 +739,4 @@ function formatReport(report) {
   return `${lines.join('\n')}\n`;
 }
 
-module.exports = { COVERAGE_DIR_ENV, DEFAULT_MAX, INSTALL_HINT, PrerequisiteError, coverageByFile, crapReport, crapScore, formatReport, parseLizardCsv, realDir, sameDir };
+module.exports = { COVERAGE_DIR_ENV, DEFAULT_MAX, INSTALL_HINT, LIZARD_CANDIDATES, LIZARD_PIN, PrerequisiteError, coverageByFile, crapReport, crapScore, formatReport, lizardCandidateAllowed, lizardRunner, parseLizardCsv, realDir, sameDir };

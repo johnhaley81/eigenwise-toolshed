@@ -7,7 +7,7 @@ const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { test } = require('node:test');
 
-const { COVERAGE_DIR_ENV, crapReport, crapScore, formatReport, parseLizardCsv, PrerequisiteError, realDir, sameDir } = require('../lib/crap.js');
+const { COVERAGE_DIR_ENV, crapReport, crapScore, formatReport, LIZARD_CANDIDATES, LIZARD_PIN, lizardCandidateAllowed, lizardRunner, parseLizardCsv, PrerequisiteError, realDir, sameDir } = require('../lib/crap.js');
 
 const CLI = path.resolve(__dirname, '../bin/quartermaster.js');
 const { SCANNED_SOURCE, unmeasuredDefinitionLines, withBodySpans } = require('../lib/crap-core.cjs');
@@ -47,9 +47,9 @@ function runner(current, base) {
   return ({ cwd }) => (path.basename(cwd).startsWith('quartermaster-crap-base-') ? base : current);
 }
 
-/** The gate resolves lizard itself, in this order; CI has no `lizard` on PATH and reaches PyPI's latest through pipx. */
+/** The gate resolves lizard itself, in this order; CI has no `lizard` on PATH and reaches the pinned release through uvx or pipx. */
 function firstWorkingLizardLauncher() {
-  return [['lizard', []], ['uvx', ['lizard']], ['pipx', ['run', 'lizard']]].find(([command, leading]) => {
+  return LIZARD_CANDIDATES.filter((candidate) => lizardCandidateAllowed(candidate)).map(({ command, leading }) => [command, leading]).find(([command, leading]) => {
     const probe = spawnSync(command, [...leading, '--version'], { encoding: 'utf8' });
     return !probe.error && probe.status === 0;
   });
@@ -603,6 +603,33 @@ test('an unresolvable lizard exits two with the install hint', () => {
   assert.equal(result.status, 2, result.stderr);
   assert.match(result.stderr, /lizard is not resolvable/);
   assert.match(result.stderr, /uv tool install lizard/);
+});
+
+test('a lizard on PATH newer than the pin is skipped in favour of the pinned uvx candidate', () => {
+  const stubbedSpawn = (onPathVersion) => {
+    const calls = [];
+    const spawn = (command, args) => {
+      calls.push([command, ...args]);
+      if (command === 'lizard' && args[0] === '--version') return { status: 0, stdout: `${onPathVersion}\n` };
+      return { status: 0, stdout: 'csv-rows' };
+    };
+    return { calls, spawn };
+  };
+  const input = { cwd: os.tmpdir(), sources: ['src/app.js'], exclude: [] };
+
+  const newer = stubbedSpawn('1.24.2');
+  assert.equal(lizardRunner({ spawn: newer.spawn })(input), 'csv-rows');
+  assert.deepEqual(newer.calls.filter(([, ...args]) => args.includes('--csv')), [['uvx', '--from', `lizard==${LIZARD_PIN}`, 'lizard', '--csv', 'src/app.js']]);
+
+  const atPin = stubbedSpawn(LIZARD_PIN);
+  lizardRunner({ spawn: atPin.spawn })(input);
+  assert.deepEqual(atPin.calls.filter(([, ...args]) => args.includes('--csv')), [['lizard', '--csv', 'src/app.js']]);
+
+  const unreadable = stubbedSpawn('no version here');
+  lizardRunner({ spawn: unreadable.spawn })(input);
+  assert.equal(unreadable.calls.some(([command, ...args]) => command === 'lizard' && args.includes('--csv')), false);
+  assert.equal(LIZARD_CANDIDATES.filter((candidate) => !candidate.onPath).every(({ leading }) => leading.includes(`lizard==${LIZARD_PIN}`)), true);
+  assert.equal(lizardCandidateAllowed(LIZARD_CANDIDATES[1], () => assert.fail('a pinned candidate needs no version probe')), true);
 });
 
 test('the CLI warns on stderr for --ratchet but stays quiet for --base', () => {
