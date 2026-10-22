@@ -168,8 +168,8 @@ changes. Show the detected stack's exact LCOV command, the config, and the deriv
 node "${CLAUDE_PLUGIN_ROOT}/bin/quartermaster.js" crap
 ```
 
-The proposal names `lizard` as the prerequisite and its install choices, `uv tool install lizard`,
-`pipx install lizard`, or `pip install lizard`. Quartermaster never installs it. An exit 2 means a
+The proposal names `lizard` as the prerequisite and its install choices, `uv tool install lizard==1.24.1`,
+`pipx install lizard==1.24.1`, or `pip install lizard==1.24.1`. Quartermaster never installs it. An exit 2 means a
 prerequisite or coverage input needs attention for an approved gate. A project without a gate
 runs its tests and continues; missing configuration never blocks the resupply round.
 

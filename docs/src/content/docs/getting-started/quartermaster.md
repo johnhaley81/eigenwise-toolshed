@@ -80,7 +80,7 @@ names the file. The gate scores what the session changed since the merge base, s
 through a merge, rebase, or pull are never demanded.
 
 It also shows the coverage command for your stack. The gate needs
-[lizard](https://github.com/terryyin/lizard) for complexity measurement. Setup never installs it. Exit
+[lizard](https://github.com/terryyin/lizard) for complexity measurement. Setup never installs it. The gate uses lizard 1.24.1 and skips a newer one on PATH; install it with `uv tool install lizard==1.24.1`. Exit
 2 means a prerequisite or measurement input is missing, including lizard finding zero functions for a
 file that has function-like source tokens. It also covers a changed line inside a function lizard
 misread so badly that no row of its own measures it, a nested function lizard dropped included, even

@@ -74,7 +74,7 @@ node bin/quartermaster.js crap [--project <path>] [--max 6] [--base <git-ref>] [
 
 Everything prints JSON except `crap`. Node standard library only, no dependencies, cross-platform.
 
-`crap` scores every function in the project with CRAP (Change Risk Anti-Patterns), `cc^2 * (1 - coverage)^3 + cc`, so a function is either simple or covered. Coverage comes from an lcov file, complexity from [lizard](https://github.com/terryyin/lizard), which reads C/C++, C#, Java, JavaScript, TypeScript, Python, Go, Rust, Ruby, PHP, Swift, Kotlin, Scala, Lua and more. It prints one line per offender plus a summary, or the whole report with `--json`.
+`crap` scores every function in the project with CRAP (Change Risk Anti-Patterns), `cc^2 * (1 - coverage)^3 + cc`, so a function is either simple or covered. Coverage comes from an lcov file, complexity from [lizard](https://github.com/terryyin/lizard) 1.24.1, which reads C/C++, C#, Java, JavaScript, TypeScript, Python, Go, Rust, Ruby, PHP, Swift, Kotlin, Scala, Lua and more. It prints one line per offender plus a summary, or the whole report with `--json`.
 
 Settings come from `.claude/quartermaster/crap.json`, and flags override it:
 
@@ -95,7 +95,7 @@ CRAP is never below cc, so a changed function with cc 6 or more fails at any cov
 
 The default base is the local branch, never `origin/<branch>`, because a fork's origin can be stale. A local base that lags its upstream makes work already merged there read as changed, so when `git rev-list --count <base>..<base>@{upstream}` is above zero, `crap` prints a one-line warning on stderr naming how many commits the base is behind. Pass `--base <base>@{upstream}`, or fetch and fast-forward the base. The warning never fails the gate.
 
-Exit codes: 0 the gate passed, 1 the gate failed, 2 a prerequisite or measurement is missing (lizard is not resolvable, there is no lcov file, the coverage command failed, or a changed line lies in a function no lizard row of its own measures, a nested function lizard dropped included; the gate corrects the spans lizard misreads and fails closed on what it cannot place). Quartermaster looks for `lizard` on PATH, then `uvx lizard`, then `pipx run lizard`; it never installs it, it prints the install hint (`uv tool install lizard`, `pipx install lizard`, or `pip install lizard`).
+Exit codes: 0 the gate passed, 1 the gate failed, 2 a prerequisite or measurement is missing (lizard is not resolvable, there is no lcov file, the coverage command failed, or a changed line lies in a function no lizard row of its own measures, a nested function lizard dropped included; the gate corrects the spans lizard misreads and fails closed on what it cannot place). Quartermaster pins lizard 1.24.1: it uses `lizard` on PATH only if that is 1.24.1 or older (a newer one is skipped), then `uvx --from lizard==1.24.1 lizard`, then `pipx run --spec lizard==1.24.1 lizard`; it never installs it, it prints the install hint (`uv tool install lizard==1.24.1`, `pipx install lizard==1.24.1`, or `pip install lizard==1.24.1`).
 
 Learned rules are merged into `permissions.allow` in the project's `.claude/settings.local.json`. Existing deny rules, permission mode, and unrelated settings are kept; a write reformats the JSON with two-space indentation.
 

@@ -45,7 +45,7 @@ Blocked allowlist candidates are summarized by default; --blocked includes up to
 allowlist counts a fingerprint a PreToolUse hook blocked separately (hookBlocked) and keeps it off
 the candidate list, since a hook denial is not the same signal as a real approval or rejection.
 crap reads .claude/quartermaster/crap.json (coverageCommand, lcov, sources, exclude, base), needs
-lizard (lizard on PATH, else uvx lizard, else pipx run lizard), and checks only changed or new functions
+lizard 1.24.1 (a bare lizard on PATH only if it is 1.24.1 or older, else uvx --from lizard==1.24.1, else pipx run --spec lizard==1.24.1), and checks only changed or new functions
 at the fixed CRAP threshold ${DEFAULT_MAX}. It exits 0 pass, 1 functions at or above ${DEFAULT_MAX},
 2 unverified measurement (lizard or coverage missing, coverage command failed, or a changed line that
 no function row of its own measures, a nested function lizard dropped included).

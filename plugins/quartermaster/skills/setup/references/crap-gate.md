@@ -98,10 +98,13 @@ Quartermaster needs [lizard](https://github.com/terryyin/lizard) to measure comp
 installs lizard. If it is missing, the command exits 2 and prints this hint:
 
 ```text
-uv tool install lizard
-pipx install lizard
-pip install lizard
+uv tool install lizard==1.24.1
+pipx install lizard==1.24.1
+pip install lizard==1.24.1
 ```
+
+The gate pins lizard 1.24.1, because 1.24.2 reads some TypeScript differently and changes gate results. A
+newer lizard on PATH is skipped, as is one whose version does not parse.
 
 Exit 2 also covers a missing LCOV file, a configured coverage command that fails, or an unverified
 measurement. A file where lizard finds zero functions despite function-like source tokens, or a changed
