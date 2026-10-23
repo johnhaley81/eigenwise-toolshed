@@ -10,8 +10,13 @@ Upstream releases stay below patch 1000. A fork number is `<upstream major>.<ups
 for example upstream `5.9.0` becomes `5.9.1000`. The fork number always sorts after upstream's
 patches of the same minor, and an update check never mistakes it for a different release.
 
-For each plugin the script compares `plugins/<name>` on `live` with the upstream ref. It ignores
-`plugin.json`, because the script rewrites that file itself.
+For each plugin the script compares `plugins/<name>` on `live` with the upstream release that `live`
+holds. Without `--upstream`, that is `git merge-base HEAD upstream/main`: a sync merge brings upstream
+`main` into `live`, so the merge base is the last upstream release `live` merged. While a sync is held,
+`upstream/main` is newer than that, and numbering against it would give unchanged plugins fork numbers.
+`--upstream <ref>` skips the merge base and uses that commit exactly as given. The script prints the
+upstream commit it used on its first output line. It ignores `plugin.json`, because the script rewrites
+that file itself.
 
 | Situation | Next version |
 | --- | --- |
@@ -30,10 +35,10 @@ and the scheme needs a new base.
 
 Run from the repository root, on `live`, with a clean working tree.
 
-1. `node scripts/fork/release.mjs --dry-run` prints a table of plugin, upstream, current, next and
-   the reason. It changes nothing. If the `upstream/main` ref is missing, the script fetches
-   upstream's `main` into a temporary ref and removes it afterwards. Run `git fetch upstream` first
-   if you want the newest upstream.
+1. `node scripts/fork/release.mjs --dry-run` prints the upstream commit it used, then a table of
+   plugin, upstream, current, next and the reason. It changes nothing. If the `upstream/main` ref is
+   missing, the script fetches upstream's `main` into a temporary ref and removes it afterwards. Run
+   `git fetch upstream` first so the merge base is computed against the newest `upstream/main`.
 2. `node scripts/fork/release.mjs --write` writes the versions and makes one commit named
    `fork release fork-v<marketplace version>`. It writes the three version fields of each plugin
    together, through the same code the upstream release uses.

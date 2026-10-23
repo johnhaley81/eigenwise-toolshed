@@ -139,7 +139,7 @@ test('a second release after an upstream minor move records the new upstream ver
   repo.git('tag', '-a', 'fork-v3.10.1000', '-m', 'fork release');
   moveUpstreamToMinor(repo);
 
-  execute(repo, ['--write']);
+  execute(repo, ['--write', '--upstream', 'upstream/main']);
 
   assert.equal(readForkBase(repo).marketplaceVersion, '3.11.0');
   assert.equal(readVersion(repo, '.claude-plugin/marketplace.json'), '3.11.1000');
@@ -196,10 +196,74 @@ test('a named upstream ref that does not exist is an error, not a fetch', (t) =>
   assert.throws(() => execute(repo, ['--dry-run', '--upstream', 'nowhere/main']), /does not exist/);
 });
 
+test('an upstream main that moved past what HEAD merged is not the base for numbering', (t) => {
+  const repo = setup(t);
+  const merged = repo.git('rev-parse', 'HEAD');
+  repo.write('plugins/beta/index.js', '// forked\n');
+  repo.commit('fork change');
+  moveUpstreamToMinor(repo);
+  const newer = repo.git('rev-parse', 'upstream/main');
+
+  const output = execute(repo, ['--write']);
+
+  assert.notEqual(newer, merged);
+  assert.ok(output.startsWith(`Upstream: ${merged} (merge base of HEAD and upstream/main; upstream/main is at ${newer}, ahead of what HEAD merged)\n`));
+  assert.match(output, /alpha\s+1\.2\.0\s+1\.2\.0\s+1\.2\.0\s+identical to upstream/);
+  assert.match(output, /beta\s+0\.4\.0\s+0\.4\.0\s+0\.4\.1000\s+first fork number/);
+  assert.match(output, /\(marketplace\)\s+3\.10\.0\s+3\.10\.0\s+3\.10\.1000\s+first fork number/);
+  assert.equal(readVersion(repo, 'plugins/alpha/.claude-plugin/plugin.json'), '1.2.0');
+  assert.equal(readVersion(repo, '.claude-plugin/marketplace.json'), '3.10.1000');
+  assert.equal(readForkBase(repo).marketplaceVersion, '3.10.0');
+});
+
+test('when HEAD contains upstream main the merge base is upstream main itself', (t) => {
+  const repo = setup(t);
+  repo.write('plugins/beta/index.js', '// forked\n');
+  repo.commit('fork change');
+  moveUpstreamToMinor(repo);
+  repo.git('merge', '--no-edit', 'upstream/main');
+  const tip = repo.git('rev-parse', 'upstream/main');
+
+  const defaulted = execute(repo, ['--dry-run']);
+  const explicit = execute(repo, ['--dry-run', '--upstream', 'upstream/main']);
+
+  assert.ok(defaulted.startsWith(`Upstream: ${tip} (merge base of HEAD and upstream/main)\n`));
+  assert.equal(defaulted.split('\n').slice(1).join('\n'), explicit.split('\n').slice(1).join('\n'));
+  assert.match(defaulted, /alpha\s+1\.3\.0\s+1\.3\.0\s+1\.3\.0\s+identical to upstream/);
+  assert.match(defaulted, /\(marketplace\)\s+3\.11\.0\s+3\.11\.0\s+3\.11\.1000\s+first fork number/);
+});
+
+test('an explicit --upstream wins over the merge base', (t) => {
+  const repo = setup(t);
+  repo.write('plugins/beta/index.js', '// forked\n');
+  repo.commit('fork change');
+  moveUpstreamToMinor(repo);
+  const newer = repo.git('rev-parse', 'upstream/main');
+
+  const output = execute(repo, ['--dry-run', '--upstream', 'upstream/main']);
+
+  assert.ok(output.startsWith(`Upstream: ${newer} (--upstream upstream/main)\n`));
+  assert.match(output, /alpha\s+1\.3\.0\s+1\.2\.0\s+1\.3\.0\s+identical to upstream/);
+  assert.match(output, /\(marketplace\)\s+3\.11\.0\s+3\.10\.0\s+3\.11\.1000\s+first fork number/);
+});
+
+test('a fetched default upstream is also reduced to the merge base', (t) => {
+  const repo = setup(t);
+  const merged = repo.git('rev-parse', 'HEAD');
+  repo.git('update-ref', '-d', 'refs/remotes/upstream/main');
+  repo.write('plugins/alpha/index.js', '// forked\n');
+  repo.commit('fork change');
+
+  const output = execute(repo, ['--dry-run'], { upstreamUrl: repo.origin });
+
+  assert.ok(output.startsWith(`Upstream: ${merged} `));
+});
+
 test('exactly one of --dry-run and --write is required', () => {
   assert.throws(() => parseOptions([]), /exactly one/);
   assert.throws(() => parseOptions(['--dry-run', '--write']), /exactly one/);
-  assert.equal(parseOptions(['--write']).upstream, 'upstream/main');
+  assert.equal(parseOptions(['--write']).upstream, undefined);
+  assert.equal(parseOptions(['--write', '--upstream', 'abc']).upstream, 'abc');
 });
 
 test('a plugin missing from upstream stops the plan', () => {

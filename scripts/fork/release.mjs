@@ -34,6 +34,19 @@ export function resolveUpstream(git, ref, url) {
   return fetchUpstream(git, url);
 }
 
+// Sync merges bring upstream main into `live`, so the merge base is the upstream release `live` holds.
+// Numbering against a newer upstream main would give unchanged plugins fork numbers while a sync is held.
+// An explicit --upstream is the caller's own choice and is used as given.
+export function chooseUpstream(git, option, url) {
+  if (option !== undefined) return { sha: resolveUpstream(git, option, url), description: `--upstream ${option}` };
+  const tip = resolveUpstream(git, DEFAULT_UPSTREAM, url);
+  const base = git.invoke(['merge-base', 'HEAD', tip], { allowFail: true });
+  const sha = base.stdout.trim();
+  if (base.code !== 0 || sha === '') throw new Error(`HEAD shares no history with ${DEFAULT_UPSTREAM} (${tip}); pass --upstream to choose the upstream commit`);
+  const ahead = sha === tip ? '' : `; ${DEFAULT_UPSTREAM} is at ${tip}, ahead of what HEAD merged`;
+  return { sha, description: `merge base of HEAD and ${DEFAULT_UPSTREAM}${ahead}` };
+}
+
 export function lastForkTag(git) {
   const result = git.invoke(['describe', '--tags', '--abbrev=0', '--match', 'fork-v*', 'HEAD'], { allowFail: true });
   return result.code === 0 ? result.stdout.trim() : null;
@@ -92,13 +105,13 @@ export function formatTable({ rows, marketplace }) {
   return lines.map((line) => line.map((cell, column) => cell.padEnd(widths[column])).join('  ').trimEnd()).join('\n');
 }
 
-function loadPlan(git, cwd, upstreamRef, upstreamUrl) {
-  const upstreamSha = resolveUpstream(git, upstreamRef, upstreamUrl);
+function loadPlan(git, cwd, upstreamOption, upstreamUrl) {
+  const { sha: upstreamSha, description } = chooseUpstream(git, upstreamOption, upstreamUrl);
   const upstream = readManifest(commitSource(git, upstreamSha), cwd);
   const current = readManifest(commitSource(git, git.revParse('HEAD')), cwd);
   const errors = [upstream, current].flatMap(checkManifest);
   if (errors.length > 0) throw new Error(`manifest check failed:\n${errors.join('\n')}`);
-  return { current, plan: planRelease({ upstream, current, facts: gitFacts(git, upstreamSha, lastForkTag(git)) }) };
+  return { current, upstreamNote: `Upstream: ${upstreamSha} (${description})`, plan: planRelease({ upstream, current, facts: gitFacts(git, upstreamSha, lastForkTag(git)) }) };
 }
 
 // The quartermaster hooks compare this against Eigenwise's marketplace version to say when the fork needs a sync.
@@ -132,7 +145,7 @@ export function parseOptions(argv) {
     options: {
       'dry-run': { type: 'boolean', default: false },
       write: { type: 'boolean', default: false },
-      upstream: { type: 'string', default: DEFAULT_UPSTREAM },
+      upstream: { type: 'string' },
     },
   });
   if (values['dry-run'] === values.write) throw new Error('pass exactly one of --dry-run or --write');
@@ -145,7 +158,8 @@ export function run(argv, { cwd = process.cwd(), out = console.log, upstreamUrl 
   const root = createGit({ cwd }).capture(['rev-parse', '--show-toplevel']);
   const git = createGit({ cwd: root });
   if (options.write && !git.isClean()) throw new Error('the working tree has uncommitted changes; commit or stash them before --write');
-  const { current, plan } = loadPlan(git, root, options.upstream, upstreamUrl);
+  const { current, plan, upstreamNote } = loadPlan(git, root, options.upstream, upstreamUrl);
+  out(upstreamNote);
   out(formatTable(plan));
   if (options.write) writeRelease(git, root, current, plan, out);
   else out(`Would record ${FORK_BASE_PATH}: ${JSON.stringify(forkBase(plan))}`);
