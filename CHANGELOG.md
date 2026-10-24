@@ -8,6 +8,96 @@ Releases before v3.208.0 predate this file and are not backfilled; `git log` is 
 those. Entries are generated from `.release/unreleased/*.md` by `scripts/release/cut.mjs`, so
 nothing here is hand-written.
 
+## v3.611.0 (2026-10-24)
+
+### model-gateway 0.55.1 → 0.55.2
+
+#### Fixes
+
+- Reap birth-identified stale gateway workers without interrupting healthy streams (GH-577) [`f36e415`](https://github.com/Eigenwise/eigenwise-toolshed/commit/f36e4150778d054e56cca8db2ff191bfb0015620)
+  Keep healthy-start orphan cleanup, but require an install-scoped worker birth record, exact live PID/start identity, an older version, a conclusively lost birth parent, and ancestry outside the serving supervisor. Request only single-target termination without escalation. Preserve healthy workers, streams, foreign processes and unknown ownership.
+- Keep the readiness gate working when a session's directory was deleted (GH-618) [`5e0109e`](https://github.com/Eigenwise/eigenwise-toolshed/commit/5e0109e14)
+  A worktree removed under a live session no longer blocks every prompt with a chdir ENOENT; the gate keeps the directory it inherited from the host.
+
+### quality-gate 1.2.1 → 1.3.0
+
+#### Features
+
+- Configurable coverage command timeouts (SQ-3873)
+  Fixes GH-599. Coverage commands run without a time limit by default. Set `coverageTimeoutMs` in current or legacy CRAP config, or override it with `--coverage-timeout-ms`. Zero means unlimited. Timeouts kill the coverage process tree on Windows and POSIX and report the duration plus both controls.
+
+#### Fixes
+
+- Pass coverage-independent CRAP bounds with unverified coverage (SQ-3871)
+  A cc 1 body now passes when coverage is UNVERIFIED because its maximum CRAP is 2, below the strict threshold of 6. Reports keep the coverage reason and show the bound. cc 2 to 5 still need coverage; cc 6 and above still fail. The same rule applies to measure JSON without bypassing branch checks.
+- Match TypeScript executable lines to Vitest v8 LCOV (SQ-3872)
+  Use initializer and inner expression lines for split variable declarations and parenthesized arrow bodies. Skip uninitialized declarations so complete Vitest v8 coverage stays measured (GH-627).
+
+### sidequest 6.2.0 → 6.3.0
+
+#### Features
+
+- Dashboard ticket list serves card rows, not whole tickets (SQ-3863)
+  Fixes GH-629. `GET /api/tickets` now returns card rows (a 280-character `summary`, `commentCount`, a slim `category`, no dispatch, submission, comment or verification history), takes `?status=todo,doing` alongside `?project=` and `?archived=1`, and builds in 25-ticket pages that yield to the event loop, so `/api/health` keeps answering while a big home lists. The new `GET /api/tickets/:id?project=slug` returns the whole ticket, and the dashboard reads it when a ticket dialog opens. The dashboard polls only the selected board and takes per-board counts from `/api/projects`. On a seeded 11-board, 2,255-ticket home the all-project list went from 35.8 MB to 1.5 MB and health latency during the build from 1.5 to 2 s down to 25 to 54 ms. Board search now matches the title, ref, labels and the description summary, not text deep in a long description.
+
+#### Fixes
+
+- Accept single-quoted literals in verify commands (SQ-3864)
+  Verify commands now accept single-quoted jq bindings, named captures and grep patterns. Placeholder and environment-variable checks still apply outside single quotes, including variables inside double quotes. Repeated unset variable names produce one message.
+- Keep candidate overlap checks within the recorded integration branch (SQ-3865)
+  Wave assembly ignores overlapping pending candidates targeting another integration branch. Same-branch candidates still refuse with `candidate_overlap`.
+- Fix compound Git guard checks and report guard failures (SQ-3869)
+  Resolve chained relative `cd` commands before checking each Git segment. Keep destructive and publication checks active across the whole compound command, and name unsupported directory expressions in parse refusals.
+
+  Guard errors now name the guard, tool, and error in the debug log and a transient toast. Refusing guards block unchecked calls; advisory guards continue with a visible diagnostic.
+- Resolve research spawns from subdirectories and linked worktrees (SQ-3876)
+  Ticketless research uses the shared project-root resolver and ignores --project inside task commands. Unresolved projects get a project-resolution refusal instead of a misleading prefix error.
+
+## v3.610.0 (2026-10-22)
+
+### quality-gate 1.2.0 → 1.2.1
+
+#### Fixes
+
+- Enforce the measurement complexity floor and redirect receipts (SQ-3851)
+  Native V8 measurement fails new and complexity-raised bodies at complexity 6 or more even when coverage is unverified. Both scoring commands accept `--receipts-dir` and `QUALITY_GATE_RECEIPTS_DIR` to keep receipts outside the measured project.
+
+### sidequest 6.1.2 → 6.2.0
+
+#### Features
+
+- Integration records native quality receipts before delivery (SQ-3837)
+  Integration captures the pinned verifier with the configured Quality Gate, measures each candidate range, refuses measured failures, and records local receipts and candidate measurement debt.
+
+#### Fixes
+
+- Base isolated read-only dispatches at the integration branch (SQ-3834)
+  Isolated read-only dispatches follow the same integration-branch base policy as write dispatches. Dispatch results, spawn prompts, and briefings name the resolved base commit and branch.
+- Allow read-only Git inspection of the shared checkout (SQ-3835)
+  Read-only and isolated executors can inspect shared checkout status, worktree listings and other allowed Git reads. The shell and isolation guards share the same read-only predicate, including parsing global Git flags. Mutations still refuse.
+- Restore inherited repairs and provision scoped plugin dependencies (SQ-3836)
+  Related repairs restore candidate ancestry with a merge and automatically record unchanged inherited tests without extra control markers. Worktree provisioning installs scoped plugins' locked dependencies. Executor guidance follows the board's recorded verification concurrency policy.
+- Keep an oracle review's verdict reachable and route every verdict refusal to one shape (SQ-3840)
+  `groomClose` now refuses a bound review that is still awaiting its oracle verdict (`oracle_verdict_pending`), so closing it first can't drop the outcome. Verdict refusals no longer point at each other: naming the reviewed source as `ref` refuses `review_ref_required` with the review's next shape, a review closed with its oracle round unanswered refuses `oracle_round_closed` with the reopen-then-verdict recovery, and finalize shape errors print the exact `finalize` fields with the review's own source and candidate filled in.
+- Keep integration on the ticket's recorded branch (SQ-3843)
+  Singleton and wave delivery now keep the recorded integration branch when the registered checkout is on a release or topic branch. A separate worktree handles delivery without switching that checkout. Target overrides refuse, and apply worktrees retain their staged changes.
+- Preserve recorded delivery targets during integration closure (SQ-3848)
+  Integration closure keeps validated delivery targets when the board default changes. Frozen dispatch targets still take priority, and abandonment keeps its validated fallback when the frozen branch disappeared. Target checks avoid Git under the SQLite write lock. Detailed publishing and read-only guidance now lives in references so the main skill stays within its loading budget.
+- Align readonly dispatch regression fixtures with current contracts (SQ-3850)
+  Update the MCP descriptor golden from live descriptors and check that readonly isolated dispatches default to the integration branch while honoring configured bases.
+- Keep scoped dependency installs outside the worktree hook budget (SQ-3853)
+  Worktree provisioning links scoped plugin dependencies with matching lockfiles and records ownership for cleanup. Missing dependencies are deferred to the executor with the install command in its briefing. Setup retains its configured timeout.
+- Gate deliveries with importing plugin tests (SQ-3854)
+  Integration records the plugin test files that import changed modules and runs files outside the pinned verifier in serial, bounded batches. A failing importing test blocks delivery.
+- Include the shared read-only git predicate in isolated module tests (SQ-3856)
+  Copy the shared read-only git predicate into the guards module test fixture so CI can load the guards and exercise git and MCP permissions.
+- Keep dispatch base summaries within the Windows context budget (SQ-3857)
+  Dispatch results and spawn prompts use a 12-character base SHA with the branch name. Executor briefings retain the full SHA.
+- Preserve full-suite capture environment during integration quality checks (SQ-3858)
+  Integration quality capture keeps the full-suite slot environment and runs measurement after verification. Worktree isolation regressions now expect the shortened dispatch base while keeping the full commit in briefings.
+- Keep dispatch context in the briefing and diagnose payload growth (SQ-3859)
+  Move executor task details into the token-gated briefing. Normalize benchmark home and checkout paths for Windows CI, and name result fields and prompt sentences in byte-budget failures.
+
 ## v3.609.0 (2026-10-21)
 
 ### model-gateway 0.55.0 → 0.55.1

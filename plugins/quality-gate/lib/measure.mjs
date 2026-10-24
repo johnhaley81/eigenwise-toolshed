@@ -18,17 +18,30 @@ export function gateVerdict(changedMetrics) {
   const enforced = enforcedMetrics(changedMetrics);
   return {
     failures: enforced.filter(measuredFailure).map(formatMetric),
-    unverified: enforced.filter((metric) => metric.unverified || metric.branches?.some((branch) => branch.unverified)),
+    unverified: enforced.filter((metric) => hasOpenCoverageQuestion(metric) || metric.branches?.some((branch) => branch.unverified)),
   };
 }
 
 function measuredFailure(metric) {
+  if (metric.complexity >= THRESHOLD) return true;
   if (metric.unverified) return false;
   return metric.crap >= THRESHOLD || metric.branches?.some((branch) => branch.untaken.length > 0);
 }
 
 export function crapScore(complexity, coverage) {
   return complexity ** 2 * (1 - coverage) ** 3 + complexity;
+}
+
+export function passesRegardlessOfCoverage(metric) {
+  return !metric.informational && Number.isFinite(metric.complexity) && metric.complexity > 0 && crapScore(metric.complexity, 0) < THRESHOLD;
+}
+
+export function hasOpenCoverageQuestion(metric) {
+  return Boolean(metric.unverified) && !passesRegardlessOfCoverage(metric);
+}
+
+export function withCoverageBound(metric) {
+  return metric.unverified && passesRegardlessOfCoverage(metric) ? { ...metric, boundVerdict: 'pass' } : metric;
 }
 
 export async function readOutput(outputPath, coverageScripts, needsFunctions, { projectRoot, analyzer, text }) {
@@ -156,7 +169,7 @@ async function measureWithAnalyzer(analyzer, { projectRoot, base, coverageDirect
     if (result.status !== 0) throw new Error(result.stderr.trim());
     return analyzer.collectFunctions(result.stdout, relativePath);
   };
-  const changedMetrics = await changedMetricsAgainstBase(metrics, relativePaths, base, readBaseline);
+  const changedMetrics = (await changedMetricsAgainstBase(metrics, relativePaths, base, readBaseline)).map(withCoverageBound);
   return { metrics, changedMetrics, ...gateVerdict(changedMetrics), summary: branchSummary(changedMetrics) };
 }
 
@@ -169,5 +182,7 @@ export function branchSummary(metrics) {
 
 export function formatMetric(metric) {
   const branches = (metric.branches ?? []).filter((branch) => branch.untaken.length).map((branch) => `${metric.relativePath}:${branch.line} ${branch.text} untaken=${branch.untaken.join(',')}`);
-  return `${metric.relativePath}:${metric.line} ${metric.name} cc=${metric.complexity} coverage=${(metric.coverage * 100).toFixed(2)}% CRAP=${metric.crap.toFixed(4)}${branches.length ? '; branches: ' + branches.join('; ') : ''}`;
+  const measurement = metric.unverified ? `coverage=UNVERIFIED (${metric.unverified}) CRAP=UNVERIFIED` : `coverage=${(metric.coverage * 100).toFixed(2)}% CRAP=${metric.crap.toFixed(4)}`;
+  const failure = metric.complexity >= THRESHOLD ? '; failure: complexity floor' : '';
+  return `${metric.relativePath}:${metric.line} ${metric.name} cc=${metric.complexity} ${measurement}${failure}${branches.length ? '; branches: ' + branches.join('; ') : ''}`;
 }

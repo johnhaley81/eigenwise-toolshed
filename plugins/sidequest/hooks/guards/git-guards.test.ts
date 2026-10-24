@@ -45,6 +45,9 @@ async function world(on: On, setup: World): Promise<string[][]> {
   const runs: string[][] = []
   on('session.cwd', () => ({ value: setup.cwd }))
   on('session.id', () => ({ value: SESSION }))
+  on('agent.list', () => ({ value: [] }))
+  on('ui.log', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
   on('fs.exists', ($, e) => ({ value: directories.has(key(e.path)) || files.has(key(e.path)) }))
   on('fs.read', ($, e) => {
     const text = files.get(key(e.path))
@@ -55,8 +58,12 @@ async function world(on: On, setup: World): Promise<string[][]> {
     const cwd = e.init?.cwd ?? setup.cwd
     runs.push([...e.argv])
     const repo = setup.repos.find((candidate) => key(candidate.root) === key(cwd))
-    const answer = setup.git?.(e.argv, cwd) ?? fakeGit(e.argv, repo, setup.integrationBranch)
-    return { value: { stderr: '', ...answer } }
+    try {
+      const answer = setup.git?.(e.argv, cwd) ?? fakeGit(e.argv, repo, setup.integrationBranch)
+      return { value: { stderr: '', ...answer } }
+    } catch (error) {
+      return { deny: String(error) }
+    }
   })
   on('tool.call', () => ({ result: 'ran', text: 'ran' }) as never)
   return runs
@@ -90,6 +97,16 @@ function wholeTreeWrites(target: string): string[] {
 
 const projectRepo: Repo = { root: PROJECT, commonDir: `${PROJECT}\\.git` }
 const CLONE = `${HOME}\\projects\\proj-x\\verification\\SQ-3436\\pr450`
+
+for (const suffix of ['status --porcelain -- app routes', 'log', 'show', 'diff', 'rev-parse', 'rev-list', 'ls-files', 'ls-tree', 'cat-file', 'branch', 'branch --list feature*', 'branch --show-current', 'worktree list', 'remote -v', 'describe', 'blame']) {
+  test(`SQ-3835: isolated executor can read shared checkout with ${suffix}`, async ($, on) => {
+    const worktree = `${await worktreeRoot()}\\agent-reader`
+    await world(on, { cwd: worktree, repos: [projectRepo], registered: [PROJECT], rows: [
+      { ref: 'SQ-3835', agentId: 'reader', worktree, sharedTree: false, state: 'claimed' },
+    ] })
+    expect((await bash($, `git -C "${PROJECT}" -c color.ui=false ${suffix}`, 'reader')).deny).toBeUndefined()
+  })
+}
 
 test('destructive git: an evidence clone under the ticket verification directory is not the shared checkout', async ($, on) => {
   const clone: Repo = { root: CLONE, commonDir: `${CLONE}\\.git`, dirty: [' D README.md'] }
@@ -162,7 +179,7 @@ test('the publish lock admits its own session and repo, and a Git Bash /c/ path 
 
 test('destructive git fails closed when its check cannot run', async ($, on) => {
   await world(on, { cwd: PROJECT, repos: [projectRepo], registered: [PROJECT], git: () => { throw new Error('git is not installed') } })
-  expect(await bash($, 'git reset --hard HEAD')).toMatchObject({ deny: 'sidequest: destructive git guard could not run; refusing git reset --hard HEAD' })
+  expect(await bash($, 'git reset --hard HEAD')).toMatchObject({ deny: expect.stringMatching(/guard-destructive-git failed for Bash:.*git is not installed; tool call refused/) })
   expect(await bash($, 'git status')).toMatchObject({ text: 'ran' })
 })
 
@@ -223,12 +240,35 @@ test('a shared-tree claim cannot raw-commit in the shared checkout', async ($, o
   expect(await bash($, 'git add README.md', 'shared-commit-agent')).toMatchObject({ text: 'ran' })
 })
 
-test('the shared-checkout guard fails open when git cannot run', async ($, on) => {
+test('the shared-checkout guard fails closed when git cannot run', async ($, on) => {
   await world(on, {
     cwd: PROJECT,
     rows: [{ ref: 'SQ-77', agentId: 'shared-commit-agent', worktree: null, sharedTree: true, state: 'claimed' }],
     repos: [projectRepo],
     git: () => { throw new Error('git is not installed') },
   })
-  expect(await bash($, 'git commit -m wip', 'shared-commit-agent')).toMatchObject({ text: 'ran' })
+  expect(await bash($, 'git commit -m wip', 'shared-commit-agent')).toMatchObject({ deny: expect.stringMatching(/guard-shared-checkout-git failed for Bash:.*git is not installed; tool call refused/) })
+})
+
+test('compound git segments resolve chained relative cd and preserve non-git heredocs', async ($, on) => {
+  const nested = { root: 'C:\\repos\\project', commonDir: 'C:/repos/project/.git', dirty: ['?? work.txt'] }
+  await world(on, { cwd: 'C:/', repos: [projectRepo, nested], registered: [nested.root] })
+  expect(await bash($, 'cd repos && cd project && git push origin main')).toMatchObject({ text: 'ran' })
+  expect(await bash($, "cd repos; cd project; rm disposable; git add -A && git commit -F - <<'EOF'\nmessage\nEOF")).toMatchObject({ text: 'ran' })
+  expect(await bash($, 'cd repos && cd project && git reset --hard HEAD')).toMatchObject({ deny: expect.stringContaining('work.txt') })
+})
+
+test('every compound destructive or publishing segment keeps its own repository authority', async ($, on) => {
+  const other = { root: 'C:\\other', commonDir: 'C:/other/.git', dirty: ['?? other-work.txt'] }
+  await world(on, { cwd: PROJECT, repos: [projectRepo, other], registered: [PROJECT, other.root], integrationBranch: 'dev', files: {
+    [PROJECT + '/.git/sidequest-publish.lock']: JSON.stringify({ sessionId: SESSION, repo: PROJECT }),
+  } })
+  expect(await bash($, 'git push origin main; cd C:/other && git push origin main')).toMatchObject({ deny: expect.stringContaining('publish lock') })
+  expect(await bash($, 'git reset --hard HEAD; cd C:/other && git reset --hard HEAD')).toMatchObject({ deny: expect.stringContaining('other-work.txt') })
+})
+
+test('unresolved cd and malformed git segments name the parse failure', async ($, on) => {
+  await world(on, { cwd: PROJECT, repos: [projectRepo], registered: [PROJECT] })
+  expect(await bash($, 'cd "$TARGET" && git push origin main')).toMatchObject({ deny: expect.stringContaining('could not parse command segment: cd "$TARGET"') })
+  expect(await bash($, 'git push origin "main')).toMatchObject({ deny: expect.stringContaining('could not parse command segment: git push origin "main') })
 })

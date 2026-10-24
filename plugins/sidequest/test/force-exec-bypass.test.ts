@@ -1,11 +1,47 @@
 import './hooks.test.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { shellSegments, namesShellWrite } from '../src/hooks/shared/shell-writes.js';
+import { readOnlyShellRefusal } from '../src/hooks/shared/read-only-shell.js';
+import { gitInvocations, shellTokens } from '../hooks/guards/git-command.js';
+import { isReadOnlyGit } from '../src/hooks/shared/read-only-git.js';
+
+const SHARED_GIT_READS = [
+  'status --porcelain -- bin/docai_refactored app routes', 'log', 'show HEAD', 'diff',
+  'rev-parse --git-dir', 'rev-list HEAD', 'ls-files', 'ls-tree HEAD', 'cat-file -p HEAD',
+  'branch', 'branch --list feature*', 'branch --show-current', 'worktree list',
+  'remote -v', 'describe', 'blame README.md',
+];
+const SHARED_GIT_WRITES = [
+  'add .', 'checkout other', 'worktree add other', 'worktree remove other', 'worktree move a b',
+  'worktree prune', 'stash', 'branch other', 'branch --list --delete other', 'remote add other url',
+  'diff --output=result', 'unknown-command',
+];
+
+test('SQ-3835: shared-checkout git reads pass shell and executor admission predicates', () => {
+  for (const suffix of SHARED_GIT_READS) {
+    const command = `git -C "C:/shared checkout" -c color.ui=false ${suffix}`;
+    assert.equal(namesShellWrite(command), false, command);
+    assert.equal(readOnlyShellRefusal(command, process.cwd()), null, command);
+    const invocation = gitInvocations(command)[0]!;
+    assert.ok(invocation, command);
+    assert.equal(isReadOnlyGit(invocation.subcommand, shellTokens(invocation.args)), true, command);
+  }
+});
+
+test('SQ-3835: shared-checkout mutations retain the read-only refusal after global flags', () => {
+  for (const suffix of SHARED_GIT_WRITES) {
+    const command = `git -C "C:/shared checkout" -c color.ui=false ${suffix}`;
+    assert.equal(namesShellWrite(command), true, command);
+    assert.match(readOnlyShellRefusal(command, process.cwd())!, /read-only executor, refusing a git mutation/, command);
+    const invocation = gitInvocations(command)[0]!;
+    assert.equal(isReadOnlyGit(invocation.subcommand, shellTokens(invocation.args)), false, command);
+  }
+});
 
 test('SQ-3808: heredoc bodies never become shell write targets', () => {
   assert.deepEqual(shellSegments("cat > /scratch/probe.py <<'EOF'\ndef f() -> int:\n    return 2 > 1\nEOF").flatMap((segment) => segment.redirects), ['/scratch/probe.py']);
@@ -159,11 +195,11 @@ test('native write intent and undispatched Sidequest executor remain refused', (
 
 const RESEARCH_LINE = 'Read-only research run, no ticket: deliver your findings as your final message; do not claim, comment or write.';
 
-function researchDecision(project: string, toolInput: Record<string, unknown>): { denied: boolean; reason: string; updatedInput: Record<string, unknown> | undefined } {
+function researchDecision(project: string, toolInput: Record<string, unknown>, projectDirectory = project, requestedProject?: string): { denied: boolean; reason: string; updatedInput: Record<string, unknown> | undefined } {
   const result = spawnSync(process.execPath, [path.join(__dirname, '../hooks/force-exec-bypass.js')], {
-    input: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Agent', cwd: project, tool_input: toolInput }),
+    input: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Agent', cwd: project, project: requestedProject, tool_input: toolInput }),
     encoding: 'utf8', windowsHide: true, timeout: 30_000,
-    env: { ...process.env, CLAUDE_CODE_SESSION_ID: '', CLAUDE_SESSION_ID: '', CLAUDE_CODE_SUBAGENT_MODEL: '', CLAUDE_PROJECT_DIR: project },
+    env: { ...process.env, CLAUDE_CODE_SESSION_ID: '', CLAUDE_SESSION_ID: '', CLAUDE_CODE_SUBAGENT_MODEL: '', CLAUDE_PROJECT_DIR: projectDirectory },
   });
   assert.equal(result.status, 0, result.stderr);
   const output = result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput : {};
@@ -225,4 +261,42 @@ test('evidence category keeps its ticketless readonly research recipe admissible
   assert.equal(recipe.research.subagentType, 'sidequest:sidequest-exec-readonly-medium');
   const decision = researchDecision(project, { subagent_type: recipe.research.subagentType, model: recipe.research.model, description: 'Evidence research', prompt: recipe.research.promptPrefix + 'Inspect only. Save nothing.' });
   assert.equal(decision.denied, false, decision.reason);
+});
+
+
+test('GH-602: research resolves subdirectories and linked worktrees without scanning task commands', () => {
+  const store = require('../lib/store.js');
+  const agentsync = require('../lib/agentsync.js');
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'sq-602-research-'));
+  const project = path.join(fixture, 'repository');
+  fs.mkdirSync(project);
+  execFileSync('git', ['init', '-b', 'main', project], { windowsHide: true });
+  execFileSync('git', ['-C', project, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'Fixture'], { windowsHide: true });
+  const { slug } = store.ensureProject(project);
+  const category = store.getCategory('research.evidence', { project: slug });
+  const recipe = agentsync.workflowRecipe({ ...category, project: slug }, store.resolveCategoryRoute(category)).research;
+  const prompt = recipe.promptPrefix + 'Inspect the quoted command: \x60node tool.js --project missing-board\x60. Write nothing.';
+  const toolInput = { subagent_type: recipe.subagentType, model: recipe.model, prompt };
+  const subdirectory = path.join(project, 'nested');
+  fs.mkdirSync(subdirectory);
+  const internalWorktree = path.join(project, 'linked');
+  const externalWorktree = path.join(fixture, 'linked');
+  for (const worktree of [internalWorktree, externalWorktree]) {
+    execFileSync('git', ['-C', project, 'worktree', 'add', '--detach', worktree], { windowsHide: true });
+  }
+  for (const directory of [project, subdirectory, internalWorktree, externalWorktree]) {
+    const decision = researchDecision(directory, toolInput);
+    assert.equal(decision.updatedInput?.prompt, prompt, directory + ': ' + decision.reason);
+  }
+  assert.equal(researchDecision(subdirectory, toolInput, project).updatedInput?.prompt, prompt, 'cwd resolves with root CLAUDE_PROJECT_DIR');
+  const unknown = researchDecision(fixture, toolInput);
+  assert.equal(unknown.denied, true);
+  assert.ok(unknown.reason.includes('could not resolve a registered project from cwd ' + fixture), unknown.reason);
+  assert.equal(researchDecision(fixture, toolInput, fixture, slug).updatedInput?.prompt, prompt, 'explicit hook project selects a registered board');
+  assert.equal(researchDecision(fixture, toolInput, fixture, subdirectory).updatedInput?.prompt, prompt, 'explicit hook path uses the shared root resolver');
+  const wrongPrefix = researchDecision(project, { ...toolInput, prompt: prompt.replace('Read-only research run', 'Changed research run') });
+  assert.equal(wrongPrefix.denied, true);
+  assert.match(wrongPrefix.reason, /live research prefix/);
+  store.setProjectRouting(slug, 'disabled');
+  assert.match(researchDecision(subdirectory, toolInput).reason, /no usable executor route/, 'resolved research still respects disabled board routing');
 });
