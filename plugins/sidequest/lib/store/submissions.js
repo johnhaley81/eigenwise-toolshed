@@ -1,6 +1,7 @@
 "use strict";
 var import_integration_tests = require("../integration-tests.js");
 var import_integration_quality = require("../integration-quality.js");
+var import_work_provenance = require("./work-provenance");
 const { emitExternalRefUpdates } = require("./external-ref-updates.js");
 const { currentBoardPath } = require("./move.js");
 "use strict";
@@ -158,6 +159,7 @@ function createSubmissions(dependencies) {
     if (!review) return false;
     return [!relation.conflict, review.status === "done" || mainAttestedReviewOutcome(ticket, review) === "accepted"].every(Boolean);
   }
+  const UNIDENTIFIED_SOURCE_ROUTES = "This bound candidate cannot be redispatched, reworked, or reclaimed. Recover with a fresh ticket carrying the same change: dispatch it, or direct-claim it from the main thread, so its submission records an identity, bind a new review to that candidate, and once it integrates retire this one with supersede_submission";
   function terminalReviewFailure(ticket, relation) {
     const reviewTicket = relation.reviewTicket;
     if (!completedBoundReview(ticket, relation)) {
@@ -171,14 +173,14 @@ function createSubmissions(dependencies) {
     if (mainAttestedReviewOutcome(ticket, reviewTicket) === "accepted") return null;
     const provenance = reviewProvenance(ticket, reviewTicket);
     if (provenance.reason === "source_attempt_missing") {
-      return `${ticket.ref} has no terminal dispatch attempt that submitted candidate ${submitted?.value || "under review"}`;
+      return `${ticket.ref} has no terminal dispatch attempt that submitted candidate ${submitted?.value || "under review"} and no main-attestation record from a main-thread direct claim. ${UNIDENTIFIED_SOURCE_ROUTES}`;
     }
     if (provenance.reason === "review_attempt_missing") {
       return `${reviewRelationRef(relation)} has no terminal done dispatch attempt for its bound review of ${ticket.ref}`;
     }
     if (provenance.reason === "agent_identity_missing") {
       return [
-        !provenance.source && `${ticket.ref} recorded no runtime binding on the terminal attempt that submitted the candidate: no hook-bound agent id, and no recorded bind time carrying the token prefix and agent name to stand in for one. An attempt older than bind-source recording still resolves through that bind time, so this one bound nothing at all and no retry changes it: re-dispatch the ticket so the replacement attempt binds, then review the resubmitted candidate`,
+        !provenance.source && `${ticket.ref} recorded no runtime binding on the terminal attempt that submitted the candidate: no hook-bound agent id, no recorded bind time carrying the token prefix and agent name to stand in for one, and no main-attestation session from a main-thread direct claim. An attempt older than bind-source recording still resolves through that bind time, so this one bound nothing at all and no retry changes it. ${UNIDENTIFIED_SOURCE_ROUTES}`,
         !provenance.reviewer && `${reviewRelationRef(relation)} recorded no hook-bound agent id on its terminal review attempt: a dispatch token and agent name authenticate a dispatch, not the runtime that ran it, so they cannot establish a reviewer independent of the submitter`
       ].filter(Boolean).join("; ");
     }
@@ -567,24 +569,54 @@ Expires: ${checkpoint.expiresAt}`;
     if (directlyClaimed(ticket)) return null;
     return ticket.dispatch?.verificationRequirement || ticket.dispatch?.lifecycleAttempt?.verificationRequirement || ticket.lifecycleAttempt?.verificationRequirement;
   }
+  function directClaimAttestation(ticket) {
+    const sessionId = String(ticket.claim?.runtime?.sessionId || "").trim();
+    if (dispatchState(ticket) || !directlyClaimed(ticket) || !sessionId) return {};
+    return { mainAttestation: { authority: "main-attestation", sessionId, by: ticket.claim.by, claimedAt: ticket.claim.at } };
+  }
   function directClaimCaptureInvocation(slug, ticket) {
     if (!directlyClaimed(ticket)) return "";
     const script = path.join(__dirname, "..", "verify-capture.js");
     return `node "${script}" --project ${JSON.stringify(String(readMeta(slug)?.path || slug))} --ticket ${JSON.stringify(String(ticket.ref))}`;
   }
+  const LEGACY_UNRECORDED_VERIFIER = "legacy project verifier was not recorded";
+  const NO_VERIFIER_REASON = "no project verifier and no pinned verify";
+  function recordedTicketVerifier(ticket) {
+    return String(ticket.executorVerify || ticket.submission?.verify || "").trim();
+  }
+  function ticketVerifierRequirement(ticket, command) {
+    return verificationRequirement({
+      kind: classifyVerificationKind(command, ticket.executorVerifyKind),
+      command,
+      evidence: command,
+      artifact: ticket.executorAttestationArtifact
+    });
+  }
   function pinnedVerificationRequirement(ticket) {
     const pinned = dispatchPinnedRequirement(ticket);
     if (pinned instanceof Object) return pinned;
-    const legacyCommand = String(ticket.executorVerify || ticket.submission?.verify || "").trim();
-    if (!legacyCommand) {
-      return verificationRequirement({ kind: "custom", evidence: "legacy project verifier was not recorded" });
-    }
-    return verificationRequirement({
-      kind: classifyVerificationKind(legacyCommand, ticket.executorVerifyKind),
-      command: legacyCommand,
-      evidence: legacyCommand,
-      artifact: ticket.executorAttestationArtifact
-    });
+    const command = recordedTicketVerifier(ticket);
+    return command ? ticketVerifierRequirement(ticket, command) : verificationRequirement({ kind: "custom", evidence: LEGACY_UNRECORDED_VERIFIER });
+  }
+  function deliveryVerificationRequirement(ticket) {
+    const pinned = pinnedVerificationRequirement(ticket);
+    if (!legacyCustomRequirement(pinned)) return pinned;
+    const recorded = ticketVerifierRequirement(ticket, recordedTicketVerifier(ticket));
+    return recorded.command ? recorded : pinned;
+  }
+  function standsForDelivery(submitted) {
+    return submitted instanceof Object && submitted.status !== "unverified" && submitted.evidence !== LEGACY_UNRECORDED_VERIFIER;
+  }
+  function unverifiedDelivery(requirement) {
+    return {
+      kind: requirement.kind,
+      status: "unverified",
+      evidence: NO_VERIFIER_REASON,
+      command: null,
+      logPath: null,
+      exitCode: null,
+      failureIdentities: ["verification:no-verifier"]
+    };
   }
   function replacementVerificationRequirement(value) {
     if (!value || typeof value !== "object") return null;
@@ -691,24 +723,46 @@ ${captureCommandDetails(pinnedCommand, capturedCommand)}`;
       timeoutMilliseconds
     };
   }
+  function qualityDebtFiles(ticket, quality) {
+    const unverifiedFiles = new Set(quality.unverified.map((row) => row.relativePath));
+    return (ticket.submission.changedPaths || []).filter((file) => {
+      if (file.startsWith(".release/unreleased/")) return false;
+      if (file.startsWith("docs/") && !isInScope(file, ticket.files || [])) return false;
+      return unverifiedFiles.has(file);
+    });
+  }
+  function noteQualityDebt(quality, reason) {
+    quality.debtTicketNote = "debt ticket not filed: " + reason;
+    try {
+      if (quality.receipt) fs.writeFileSync(quality.receipt, JSON.stringify(quality, null, 2) + "\n");
+    } catch (error) {
+      quality.debtTicketNote += "; receipt update failed: " + integrationGitError(error);
+    }
+  }
   function recordQualityDebt(slug, ticket, quality) {
     if (!quality.unverified.length || quality.captureGap) return;
+    const files = qualityDebtFiles(ticket, quality);
+    if (!files.length) return noteQualityDebt(quality, "no candidate source/test paths have unverified rows");
     const title = `Quality measurement debt for ${ticket.ref} at ${ticket.submission.commit}`;
-    transaction(() => {
-      if (listTickets(slug).some((existing) => existing.title === title)) return;
-      dependencies.createTicket(slug, {
-        title,
-        description: `Re-measure the immutable candidate ${ticket.submission.commit}. Receipt: ${quality.receipt}
+    try {
+      transaction(() => {
+        if (listTickets(slug).some((existing) => existing.title === title)) return;
+        dependencies.createTicket(slug, {
+          title,
+          description: `Re-measure the immutable candidate ${ticket.submission.commit}. Receipt: ${quality.receipt}
 ${JSON.stringify(quality.unverified)}`,
-        category: "coding.normal",
-        complexity: 2,
-        complexityWhy: "Capture missing native quality evidence for an existing candidate",
-        files: ticket.submission.changedPaths || [],
-        executorVerifyKind: "manual",
-        executorVerify: "Native quality-gate receipt resolves every recorded UNVERIFIED row",
-        source: "integration-quality"
+          category: "coding.normal",
+          complexity: 2,
+          complexityWhy: "Capture missing native quality evidence for an existing candidate",
+          files,
+          executorVerifyKind: "manual",
+          executorVerify: "Native quality-gate receipt resolves every recorded UNVERIFIED row",
+          source: "integration-quality"
+        });
       });
-    });
+    } catch (error) {
+      noteQualityDebt(quality, integrationGitError(error));
+    }
   }
   function verifyCandidateQuality(slug, tickets, project, timeoutMilliseconds, verify, environment) {
     const inputs = tickets.map((participant) => qualityInput(slug, participant, project, timeoutMilliseconds));
@@ -719,31 +773,46 @@ ${JSON.stringify(quality.unverified)}`,
   function verifyWithFullSuiteCapture(command, project, verify) {
     return isFullSuiteCommand(command) ? runFullSuiteVerification(command, project, verify) : verify(process.env);
   }
-  function verifyDeliveredSubmission(slug, ticket, opts) {
-    const requirement = opts?.requirement || pinnedVerificationRequirement(ticket);
+  function reusableSubmittedVerification(ticket, requirement) {
     const submitted = ticket.submission?.verificationResult;
-    if (submitted && typeof submitted === "object" && !requirement.command) return submitted;
+    return requirement.command || !standsForDelivery(submitted) ? null : submitted;
+  }
+  function attestationDeliveryVerification(ticket, requirement) {
+    return {
+      kind: "attestation",
+      status: "attestation",
+      artifact: ticket.submission?.sourceRevision?.value || requirement.artifact || null,
+      evidence: String(ticket.submission?.verify || "").trim()
+    };
+  }
+  function manualDeliveryVerification(ticket, requirement) {
+    return { kind: "manual", status: "manual", evidence: String(ticket.submission?.verify || requirement.evidenceContract), command: requirement.command || null };
+  }
+  function missingCommandVerification(requirement) {
+    return {
+      kind: requirement.kind,
+      status: "could_not_run",
+      evidence: "The prepared verification requirement has no executable command.",
+      command: null,
+      failureIdentities: ["could_not_run:missing-command"]
+    };
+  }
+  function evidenceDeliveryVerification(ticket, requirement) {
+    if (requirement.kind === "attestation" || isArtifactSubmission(ticket.submission)) return attestationDeliveryVerification(ticket, requirement);
+    if (requirement.kind === "manual") return manualDeliveryVerification(ticket, requirement);
+    return requirement.command ? null : missingCommandVerification(requirement);
+  }
+  function unexecutedDeliveryVerification(ticket, requirement, opts) {
+    const submitted = reusableSubmittedVerification(ticket, requirement);
+    if (submitted) return submitted;
     if (opts?.skipVerify === true) return skippedVerification(requirement, opts.verificationWaiver);
-    if (requirement.kind === "attestation" || isArtifactSubmission(ticket.submission)) {
-      return {
-        kind: "attestation",
-        status: "attestation",
-        artifact: ticket.submission?.sourceRevision?.value || requirement.artifact || null,
-        evidence: String(ticket.submission?.verify || "").trim()
-      };
-    }
-    if (requirement.kind === "manual") {
-      return { kind: "manual", status: "manual", evidence: String(ticket.submission?.verify || requirement.evidenceContract), command: requirement.command || null };
-    }
-    if (!requirement.command) {
-      return {
-        kind: requirement.kind,
-        status: "could_not_run",
-        evidence: "The prepared verification requirement has no executable command.",
-        command: null,
-        failureIdentities: ["could_not_run:missing-command"]
-      };
-    }
+    if (legacyCustomRequirement(requirement)) return unverifiedDelivery(requirement);
+    return evidenceDeliveryVerification(ticket, requirement);
+  }
+  function verifyDeliveredSubmission(slug, ticket, opts) {
+    const requirement = opts?.requirement || deliveryVerificationRequirement(ticket);
+    const unexecuted = unexecutedDeliveryVerification(ticket, requirement, opts);
+    if (unexecuted) return unexecuted;
     const validationError = verifyCommandError(requirement.command);
     if (validationError) {
       return {
@@ -769,7 +838,7 @@ ${JSON.stringify(quality.unverified)}`,
     };
     const participants = opts?.qualityTickets || [ticket];
     const changedPaths = participants.flatMap((participant) => participant.submission.changedPaths || []);
-    const runWithImportingTests = (environment) => (0, import_integration_tests.runImportingIntegrationTests)(project, changedPaths, verify(environment), timeoutMilliseconds, environment);
+    const runWithImportingTests = (environment) => (0, import_integration_tests.runImportingIntegrationTests)(project, changedPaths, verify(environment), timeoutMilliseconds, environment, boardConfig(slug).integrationTestFileThreshold);
     const runWithQuality = (environment) => verifyCandidateQuality(slug, participants, project, timeoutMilliseconds, runWithImportingTests, environment);
     return verifyWithFullSuiteCapture(requirement.command, project, runWithQuality);
   }
@@ -1166,7 +1235,7 @@ ${verify.outputTail}` : null
     return {
       ticket: refs,
       pinnedCommit: String(ticket.submission?.commit || ""),
-      command: pinnedVerificationRequirement(ticket).command || null,
+      command: deliveryVerificationRequirement(ticket).command || null,
       logPath: integrationVerifyLogPath(slug, ticket),
       startedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
@@ -1849,7 +1918,7 @@ ${verify.outputTail}` : null
         }
         return integrationFailure(slug, ticket, { reason: failureReason, verify, message: failureMessage });
       }
-      const deliveredFiles = revisionProof ? revisionProof.deliveredFiles : workingTreeDelivery ? workingTreeDeliveryPaths(repo) : interaction.interaction ? Array.from(/* @__PURE__ */ new Set([...deliveredCommitPaths(repo, deliveryCommit), ...interaction.interaction.paths])) : deliveredCommitPaths(repo, deliveryCommit);
+      const deliveredFiles = revisionProof ? revisionProof.deliveredFiles : workingTreeDelivery ? workingTreeDeliveryPaths(repo) : interaction.interaction ? Array.from(/* @__PURE__ */ new Set([...changedIntegrationPaths(repo, ticket.submission), ...interaction.interaction.paths])) : changedIntegrationPaths(repo, ticket.submission);
       const deliveryIdentity = {
         kind: interaction.interaction ? "reviewed-merged-tree-interaction" : workingTreeDelivery ? "pinned-working-tree" : "reachable-commit",
         pinnedRef: submissionGitRef(ticket),
@@ -2548,10 +2617,10 @@ ${verify.outputTail}` : null
     return { result, expectedEvidence: null, ...error ? { diagnostic: { code: "invalid_verify", message: error, retryable: true } } : {} };
   }
   function legacyCustomRequirement(requirement) {
-    return requirement.kind === "custom" && requirement.evidenceContract === "legacy project verifier was not recorded";
+    return requirement.kind === "custom" && requirement.evidenceContract === LEGACY_UNRECORDED_VERIFIER;
   }
   function legacyCustomSubmissionVerification(requirement, evidence) {
-    if (!evidence) return { result: { kind: "custom", status: "passed", evidence: requirement.evidenceContract }, expectedEvidence: null };
+    if (!evidence) return { result: unverifiedDelivery(requirement), expectedEvidence: null };
     const error = verifyCommandError(evidence);
     if (error) {
       return {
@@ -2775,6 +2844,7 @@ ${verify.outputTail}` : null
         ...rejectedSubmission ? { supersedesRejectedSubmission: rejectedSubmission.commit } : {},
         ...inheritedPaths.length ? { inheritedPaths } : {},
         ...unsubmittedWorkingPaths.length ? { unsubmittedWorkingPaths } : {},
+        ...directClaimAttestation(t),
         integratedAt: null
       }, range || {});
       if (rejectedSubmission) {
@@ -2975,16 +3045,6 @@ ${verify.outputTail}` : null
       const deliveredFiles = Array.isArray(repaired.integration.deliveredFiles) ? repaired.integration.deliveredFiles.map((entry) => String(entry).trim().replace(/\\/g, "/")).filter(Boolean) : [];
       const delivered = new Set(deliveredFiles);
       const missingPaths = changedPaths.filter((file) => !delivered.has(file));
-      const unreviewedMissingPaths = missingPaths.filter((file) => !replacements.has(file));
-      if (unreviewedMissingPaths.length) {
-        return {
-          ok: false,
-          reason: "lineage_paths_missing",
-          ticket: source,
-          missingPaths: unreviewedMissingPaths,
-          message: `${source.ref} supersession refused: ${repaired.repair.ref}'s recorded delivery omits submitted paths without reviewed retirement evidence: ${unreviewedMissingPaths.join(", ")}. Supply reviewedReplacements entries with path, reviewedBy, and reason for every intentionally retired path, or integrate a repair that delivers the full path lineage.${contentCommitOwed}`
-        };
-      }
       let divergentPaths;
       try {
         divergentPaths = pathsWithDifferentContent(repo, source.submission.commit, contentCommit, changedPaths);
@@ -2994,6 +3054,19 @@ ${verify.outputTail}` : null
           reason: "lineage_unavailable",
           ticket: source,
           message: `${source.ref} supersession refused while comparing delivered content: ${integrationGitError(error)}`
+        };
+      }
+      const divergent = new Set(divergentPaths);
+      const identicalPaths = missingPaths.filter((file) => !divergent.has(file));
+      const unreviewedMissingPaths = missingPaths.filter((file) => divergent.has(file) && !replacements.has(file));
+      if (unreviewedMissingPaths.length) {
+        return {
+          ok: false,
+          reason: "lineage_paths_missing",
+          ticket: source,
+          missingPaths: unreviewedMissingPaths,
+          identicalPaths,
+          message: `${source.ref} supersession refused: ${repaired.repair.ref}'s recorded delivery omits submitted paths: ${missingPaths.join(", ")}. Byte-identical omitted paths need no replacement evidence: ${JSON.stringify(identicalPaths)}. Supply reviewedReplacements entries with path, reviewedBy, and reason for the remaining omitted paths: ${unreviewedMissingPaths.join(", ")}.${contentCommitOwed}`
         };
       }
       const unreviewed = divergentPaths.filter((file) => !replacements.has(file));
@@ -3007,7 +3080,7 @@ ${verify.outputTail}` : null
         };
       }
       const now = (/* @__PURE__ */ new Date()).toISOString();
-      const reviewedReplacementPaths = new Set(missingPaths.concat(divergentPaths));
+      const reviewedReplacementPaths = new Set(divergentPaths);
       const reviewedReplacements = changedPaths.filter((file) => reviewedReplacementPaths.has(file)).map((file) => replacements.get(file));
       const supersededBy = {
         ref: repaired.repair.ref,
@@ -3016,6 +3089,7 @@ ${verify.outputTail}` : null
         deliveredAt: repaired.integration.deliveredAt || repaired.repair.submission?.integratedAt,
         closedAt: now,
         changedPaths,
+        identicalPaths,
         reviewedReplacements,
         reason
       };
@@ -3054,8 +3128,36 @@ ${verify.outputTail}` : null
       return { ok: true, ticket: source, supersededBy, comment };
     });
   }
+  function builtOnReplacements(source, followUpRef) {
+    const fragment = commitScope.ticketReleaseFragment(source.ref);
+    const paths = Array.isArray(source.submission?.changedPaths) ? source.submission.changedPaths : [];
+    return paths.map((file) => ({
+      path: file,
+      reviewedBy: followUpRef,
+      reason: file === fragment ? `${followUpRef} moved this release fragment into its own.` : `${followUpRef} delivered this candidate's whole range, and any later change here is its own verified work.`
+    }));
+  }
+  function supersedeBuiltOnSource(slug, followUp, candidate, by) {
+    const source = getTicket(slug, candidate.ref);
+    if (String(source?.submission?.commit || "").toLowerCase() !== candidate.commit) {
+      return { ref: candidate.ref, ok: false, reason: "builds_on_stale", message: `${candidate.ref} no longer holds candidate ${candidate.commit}, so ${followUp.ref}'s delivery does not supersede it.` };
+    }
+    const closed = stillSpawnsInsideItsWrite("closeSubmissionAsSuperseded", () => closeSubmissionAsSuperseded(slug, source.ref, {
+      by,
+      supersededBy: followUp.ref,
+      reason: `${followUp.ref} was dispatched to build on ${source.ref}'s candidate ${candidate.commit} and delivered it inside its own range.`,
+      reviewedReplacements: builtOnReplacements(source, followUp.ref),
+      source: "builds-on-delivery"
+    }));
+    return closed?.ok ? { ref: source.ref, ok: true } : { ref: source.ref, ok: false, reason: closed?.reason, message: closed?.message };
+  }
+  function supersedeBuiltOnSources(slug, followUpRef, by) {
+    const followUp = getTicket(slug, followUpRef);
+    const candidates = (0, import_work_provenance.buildsOnCandidates)(followUp?.submission?.workProvenance ?? followUp?.dispatch?.workProvenance);
+    return candidates.map((candidate) => supersedeBuiltOnSource(slug, followUp, candidate, by));
+  }
   function notOwnerSubmissionMessage(ref, submissionOwner, by, operation) {
-    if (operation === "rework") return `rework requires by = the submitter "${submissionOwner}" (pulse -> submittedBy); got "${by}".`;
+    if (operation === "rework") return `rework requires by = the submitter "${submissionOwner}" (pulse -> submittedBy); got "${by}". To request changes as the orchestrator, call MCP rework from the main thread with by omitted; an executor reports the need to the orchestrator instead.`;
     return `${ref} has no claim to release. Its pending submission belongs to "${submissionOwner}".`;
   }
   function submissionOwnershipFailure(ticket, by, opts) {
@@ -3091,6 +3193,18 @@ ${verify.outputTail}` : null
       };
     }
     return null;
+  }
+  function orchestratorReworkFailure(ticket) {
+    if (ticket.status === "done") return { ok: false, reason: "done", ticket };
+    const held = ticket.claim;
+    if (!held?.by) return null;
+    return { ok: false, reason: "not_owner", ticket, claim: held, message: `${ticket.ref} is claimed by "${held.by}"; the orchestrator requests changes only on a parked candidate. Ask the claim holder to release it first.` };
+  }
+  function reworkAuthorityFailure(ticket, by, opts) {
+    return opts.orchestratorSession ? orchestratorReworkFailure(ticket) : submissionOwnershipFailure(ticket, by, { allowSubmittedOwner: true, operation: "rework" });
+  }
+  function reworkRequester(opts) {
+    return opts.orchestratorSession ? { authority: "orchestrator", sessionId: String(opts.orchestratorSession) } : {};
   }
   function recordSubmissionRejection(slug, idOrRef, opts) {
     opts = opts || {};
@@ -3193,7 +3307,7 @@ ${parts.join("\n\n")}` });
       if (!pendingSubmission(ticket) && !retryCheckpoint) {
         return { ok: false, reason: "submission_required", ticket, message: `${ticket.ref} has no pending submission or retry candidate to reject for rework.` };
       }
-      const ownershipFailure = submissionOwnershipFailure(ticket, by, { allowSubmittedOwner: true, operation: "rework" });
+      const ownershipFailure = reworkAuthorityFailure(ticket, by, opts);
       if (ownershipFailure) return ownershipFailure;
       const history = rejectionHistory(ticket);
       const source = opts.source || "cli";
@@ -3217,6 +3331,7 @@ ${parts.join("\n\n")}` });
         const rejected2 = Object.assign({}, rejectedCandidate, {
           rejectedAt: (/* @__PURE__ */ new Date()).toISOString(),
           rejectedBy: by,
+          ...reworkRequester(opts),
           review: review2,
           reason: reason2,
           ...candidate.source === "git" ? { quarantineRef: rejectionQuarantineRef(ticket, history.length + 1) } : {},
@@ -3246,6 +3361,7 @@ ${parts.join("\n\n")}` });
       const rejected = Object.assign({}, ticket.submission, {
         rejectedAt: (/* @__PURE__ */ new Date()).toISOString(),
         rejectedBy: by,
+        ...reworkRequester(opts),
         review,
         reason,
         ...ticket.submission.sourceRevision ? {} : { quarantineRef: rejectionQuarantineRef(ticket, history.length + 1) },
@@ -3323,6 +3439,55 @@ ${parts.join("\n\n")}` });
     const siblingChanges = scopedPaths(sibling?.submission?.changedPaths);
     return scopedPaths(participant?.submission?.changedPaths).filter((surface) => isInScope(surface, siblingChanges));
   }
+  function trialWaveMerge(repository, left, right) {
+    const result = spawnSync("git", ["merge-tree", "--write-tree", "--name-only", left, right], {
+      cwd: repository,
+      encoding: "utf8",
+      timeout: 3e4,
+      windowsHide: true
+    });
+    if (result.error) throw result.error;
+    if (result.status === 0) return { tree: String(result.stdout).trim(), surfaces: [], evidence: "" };
+    if (result.status !== 1) throw new Error(String(result.stderr));
+    const output = String(result.stdout).trim();
+    return { tree: "", surfaces: (output.split(/\r?\n\r?\n/)[0] || "").split(/\r?\n/).slice(1), evidence: output };
+  }
+  function overlappingCandidateTrial(repository, target, participant, sibling) {
+    const siblingCommit = String(sibling.submission.commit);
+    const appliedSibling = trialWaveMerge(repository, target, siblingCommit);
+    if (appliedSibling.surfaces.length) return appliedSibling;
+    const composed = integrationGit(repository, [
+      ...COMPOSED_WAVE_MERGE_CONFIG,
+      "commit-tree",
+      appliedSibling.tree,
+      "-p",
+      target,
+      "-p",
+      siblingCommit,
+      "-m",
+      "Sidequest overlap trial"
+    ]);
+    return trialWaveMerge(repository, composed, String(participant.submission.commit));
+  }
+  function bothCandidatesAreCommits(participant, sibling) {
+    return Boolean(participant.submission?.commit && sibling.submission?.commit);
+  }
+  function guardedCandidateTrial(slug, targetBranch, participant, sibling, surfaces) {
+    try {
+      const repository = String(readMeta(slug).path);
+      const target = integrationGit(repository, ["rev-parse", targetBranch || "HEAD"]);
+      return overlappingCandidateTrial(repository, target, participant, sibling);
+    } catch (error) {
+      return { tree: "", surfaces, evidence: `Trial merge could not run, so the changed-path overlap stands: ${integrationGitError(error)}` };
+    }
+  }
+  function trialCandidateConflicts(slug, targetBranch, participant, sibling, surfaces) {
+    if (!surfaces.length) return [];
+    const pair = { participant: participant.ref, sibling: sibling.ref, surfaces };
+    if (!bothCandidatesAreCommits(participant, sibling)) return [pair];
+    const trial = guardedCandidateTrial(slug, targetBranch, participant, sibling, surfaces);
+    return trial.surfaces.length ? [{ ...pair, surfaces: trial.surfaces, evidence: trial.evidence }] : [];
+  }
   function waveScopeConflicts(slug, tickets, targetBranch) {
     const participantRefs = new Set(tickets.map((ticket) => ticket.ref));
     const boardTickets = listTickets(slug);
@@ -3334,10 +3499,20 @@ ${parts.join("\n\n")}` });
         if (!submissionWasRecordedAfter(sibling, participant)) continue;
         if (submissionIncludesCandidate(participant.submission, sibling.submission) || submissionIncludesCandidate(sibling.submission, participant.submission)) continue;
         const surfaces = collidingChangedPaths(participant, sibling);
-        if (surfaces.length) conflicts.push({ participant: participant.ref, sibling: sibling.ref, surfaces });
+        conflicts.push(...trialCandidateConflicts(slug, targetBranch, participant, sibling, surfaces));
       }
     }
     return conflicts;
+  }
+  function waveScopeRefusal(slug, tickets, targetBranch) {
+    const scopeConflicts = waveScopeConflicts(slug, tickets, targetBranch);
+    if (!scopeConflicts.length) return null;
+    return {
+      ok: false,
+      reason: "candidate_overlap",
+      conflicts: scopeConflicts,
+      message: `Wave assembly paused because submitted candidates overlap: ${scopeConflicts.map((conflict) => `${conflict.participant} and ${conflict.sibling} (${conflict.surfaces.join(", ")})`).join("; ")}. These refs each hold a pending candidate that remains eligible for delivery, not merely a live declared scope; review-rejected candidates stay parked without blocking the wave. Each conflict's evidence carries the trial merge's textual conflict, or why the trial could not run; candidates without a Git commit overlap by changed path. Resolve the reported conflicts before assembling these candidates. ${manualCandidateDeliveryGuidance()}`
+    };
   }
   function omittedPendingSubmissionOverlaps(slug, tickets) {
     if (tickets.length !== 1) return [];
@@ -3356,19 +3531,29 @@ ${parts.join("\n\n")}` });
   function waveVerifierMismatchMessage(tickets, requirements) {
     const pinnedKinds = tickets.map((ticket, index) => `${ticket.ref} ${requirements[index].kind}`).join(", ");
     const difference = new Set(requirements.map((requirement) => requirement.kind)).size > 1 ? `pin different verifier kinds (${pinnedKinds})` : `all pin kind ${requirements[0].kind} but with different commands or evidence (${pinnedKinds})`;
-    return `Wave assembly requires one project-defined verification gate. Its participants ${difference}, so this assembly cannot choose or rewrite one. Non-executable kinds (${NON_EXECUTABLE_WAVE_VERIFICATION_KINDS.join(", ")}) only need to agree on kind; executable kinds must pin the same command. ${manualCandidateDeliveryGuidance()}`;
+    return `Wave assembly requires one project-defined verification gate. Its participants ${difference}, so this assembly cannot choose or rewrite one. Non-executable kinds (${NON_EXECUTABLE_WAVE_VERIFICATION_KINDS.join(", ")}) only need to agree on kind; executable requirements run each pinned command on the composed tree. ${manualCandidateDeliveryGuidance()}`;
   }
   function waveVerificationRequirement(tickets) {
-    const requirements = tickets.map(pinnedVerificationRequirement);
+    const requirements = tickets.map(deliveryVerificationRequirement);
     const first = requirements[0];
     if (!first) return { ok: false, reason: "wave_verification_required", message: "Wave assembly requires a pinned project verification requirement." };
     const sameKind = requirements.every((requirement) => requirement.kind === first.kind);
     if (sameKind && NON_EXECUTABLE_WAVE_VERIFICATION_KINDS.includes(first.kind)) return { ok: true, requirement: first };
     const identity = waveVerifierIdentity(first);
-    if (requirements.some((requirement) => waveVerifierIdentity(requirement) !== identity)) {
+    if (!compatibleWaveVerifiers(requirements, identity)) {
       return { ok: false, reason: "wave_verifier_mismatch", message: waveVerifierMismatchMessage(tickets, requirements) };
     }
-    return { ok: true, requirement: first };
+    return { ok: true, requirement: first, requirements: distinctWaveVerifiers(requirements) };
+  }
+  function sameWaveVerifier(left, right) {
+    return waveVerifierIdentity(left) === waveVerifierIdentity(right) && left.environment === right.environment;
+  }
+  function distinctWaveVerifiers(requirements) {
+    return requirements.filter((requirement, index) => requirements.findIndex((other) => sameWaveVerifier(other, requirement)) === index);
+  }
+  function compatibleWaveVerifiers(requirements, identity) {
+    if (requirements.every((requirement) => requirement.command)) return true;
+    return requirements.every((requirement) => waveVerifierIdentity(requirement) === identity);
   }
   function provisionWaveGateWorktree(slug, candidateWorktree) {
     if (!candidateWorktree) {
@@ -3420,17 +3605,24 @@ ${parts.join("\n\n")}` });
     const requirement = waveVerificationRequirement(tickets);
     if (!requirement.ok) return requirement;
     if (opts?.skipVerify === true) return { ok: true, verification: skippedVerification(requirement.requirement, opts.verificationWaiver) };
-    if (requirement.requirement.environment === "shared") {
+    if (waveNeedsSharedEnvironment(requirement.requirement, requirement.requirements)) {
       return {
         ok: true,
         provisioning: "The gate deferred to the environment lane: the pinned command runs in the shared checkout at delivery, so nothing ran and worktree provisioning was skipped.",
-        verification: deferredVerification(requirement.requirement)
+        verification: deferredWaveVerification(requirement.requirement, requirement.requirements)
       };
     }
-    if (requirement.requirement.command) return commandWaveVerification(slug, tickets, wave, requirement.requirement);
+    if (requirement.requirement.command) return commandWaveVerification(slug, tickets, wave, requirement.requirement, requirement.requirements);
     return suppliedWaveVerification(wave.id, requirement.requirement, supplied);
   }
+  function waveNeedsSharedEnvironment(requirement, requirements = [requirement]) {
+    return requirements.some((entry) => entry.environment === "shared");
+  }
+  function deferredWaveVerification(requirement, requirements = [requirement]) {
+    return { ...deferredVerification(requirement), results: requirements.map(deferredVerification) };
+  }
   function suppliedWaveVerification(waveId, requirement, supplied) {
+    if (legacyCustomRequirement(requirement) && !standsForDelivery(supplied)) return { ok: true, verification: unverifiedDelivery(requirement) };
     if (supplied?.kind === requirement.kind) return { ok: true, verification: supplied };
     return {
       ok: false,
@@ -3438,7 +3630,7 @@ ${parts.join("\n\n")}` });
       message: `Wave ${waveId} requires recorded ${requirement.kind} gate evidence from the project-defined verifier before delivery.`
     };
   }
-  function commandWaveVerification(slug, tickets, wave, requirement) {
+  function commandWaveVerification(slug, tickets, wave, requirement, requirements = [requirement]) {
     const reused = tickets.length === 1 ? reusedSingletonGateVerification(tickets[0], requirement) : null;
     if (reused) {
       return {
@@ -3450,7 +3642,7 @@ ${parts.join("\n\n")}` });
     const checkout = waveGateCheckout(slug, tickets, wave);
     if (!checkout.ok) return checkout;
     try {
-      return verifyWaveGateCheckout(slug, wave.id, requirement, checkout);
+      return verifyWaveGateCheckout(slug, wave.id, requirements, checkout);
     } finally {
       checkout.remove();
     }
@@ -3489,7 +3681,7 @@ ${parts.join("\n\n")}` });
     fs.rmSync(checkout, { recursive: true, force: true });
     integrationGit(repository, ["worktree", "prune"]);
   }
-  function verifyWaveGateCheckout(slug, waveId, requirement, checkout) {
+  function verifyWaveGateCheckout(slug, waveId, requirements, checkout) {
     const provisioning = provisionWaveGateWorktree(slug, checkout.isolatedWorktree);
     if (!provisioning.ok) {
       return {
@@ -3498,14 +3690,25 @@ ${parts.join("\n\n")}` });
         message: `Wave ${waveId} gate could not prepare its verification environment. ${provisioning.message} No candidate was rejected.`
       };
     }
-    (0, import_integration_tests.reportIntegrationProgress)("wave gate", requirement.command);
-    const verification = runProcessVerification(requirement, {
-      cwd: checkout.cwd,
-      timeoutMilliseconds: normalizeIntegrationVerifyTimeoutMs(boardConfig(slug)?.integrationVerifyTimeoutMs),
-      logPath: integrationVerifyLogPath(slug, { ref: waveId }),
-      outputTailBytes: INTEGRATION_VERIFY_OUTPUT_TAIL_BYTES
+    return { ok: true, provisioning: provisioning.evidence, verification: verifyWaveCommands(slug, waveId, requirements, checkout) };
+  }
+  function verifyWaveCommands(slug, waveId, requirements, checkout) {
+    const results = requirements.map((requirement, index) => {
+      (0, import_integration_tests.reportIntegrationProgress)("wave gate", requirement.command);
+      const verification = runProcessVerification(requirement, {
+        cwd: checkout.cwd,
+        timeoutMilliseconds: normalizeIntegrationVerifyTimeoutMs(boardConfig(slug)?.integrationVerifyTimeoutMs),
+        logPath: integrationVerifyLogPath(slug, { ref: waveId + "-" + index }),
+        outputTailBytes: INTEGRATION_VERIFY_OUTPUT_TAIL_BYTES
+      });
+      return checkout.tree ? { ...verification, verifiedTree: checkout.tree } : verification;
     });
-    return { ok: true, provisioning: provisioning.evidence, verification: checkout.tree ? { ...verification, verifiedTree: checkout.tree } : verification };
+    const result = results.find((verification) => !verificationAccepted(verification)) || results[0];
+    return {
+      ...result,
+      results,
+      evidence: results.map((verification) => verification.command + ": " + verification.status + ". " + verification.evidence).join("\n")
+    };
   }
   function singletonWaveParticipant(wave, ref) {
     const participants = Array.isArray(wave.participants) ? wave.participants : [];
@@ -3620,6 +3823,21 @@ ${parts.join("\n\n")}` });
     if (!invalidated.some((entry) => entry.reason === "baseline_moved")) return "";
     return ` Assembled baseline ${opened.baseline.revision.source}:${opened.baseline.revision.value}; candidate baselines ${waveCandidates.map((candidate) => `${candidate.ref}=${candidate.baseline.revision.source}:${candidate.baseline.revision.value}`).join(", ")}.`;
   }
+  function waveGateFailure(gate, provisioning) {
+    const status = gate.verification.status;
+    if (status === "toolchain_missing") {
+      const provisioningEvidence = provisioning || "The gate did not use an isolated candidate worktree, so worktree provisioning was skipped.";
+      return { reason: "assembled_wave_environment_problem", message: `gate could not run because its verification environment is incomplete. ${gate.verification.evidence} ${provisioningEvidence} Provision the missing toolchain and retry; no candidate was rejected.` };
+    }
+    if (status === "unverified") {
+      return { reason: "verification_unverified", message: `gate returned unverified: ${gate.verification.evidence}, so nothing ran. Record a runnable verify on the ticket and integrate again, or pass skipVerify with a verificationWaiver (authority, reason, affectedGate, and scope or expiresAt) to deliver it unverified.` };
+    }
+    return { reason: "assembled_wave_gate_failed", message: `gate returned ${status}. Refresh and reverify its candidates before delivery.` };
+  }
+  function failedWaveGateRefusal(wave, gate, assembly, provisioning) {
+    const failure = waveGateFailure(gate, provisioning);
+    return { ok: false, reason: failure.reason, message: `Wave ${wave.id} ${failure.message}`, wave, assembly, gate };
+  }
   function assembleSubmissionWave(slug, refs, opts) {
     const participantRefs = Array.from(new Set((Array.isArray(refs) ? refs : [refs]).map((ref) => String(ref || "").trim()).filter(Boolean)));
     if (!participantRefs.length) return { ok: false, reason: "wave_participants_required", message: "Wave assembly requires one or more submitted participant refs." };
@@ -3659,15 +3877,8 @@ ${parts.join("\n\n")}` });
       return { ok: false, reason: "wave_baseline_required", message: "Every submitted candidate must retain its dispatch baseline, changed surfaces, and verifier evidence before wave assembly." };
     }
     const waveCandidates = candidates.filter((candidate) => candidate !== null);
-    const scopeConflicts = waveScopeConflicts(slug, tickets, target?.branch);
-    if (scopeConflicts.length) {
-      return {
-        ok: false,
-        reason: "candidate_overlap",
-        conflicts: scopeConflicts,
-        message: `Wave assembly paused because submitted candidates overlap: ${scopeConflicts.map((conflict) => `${conflict.participant} and ${conflict.sibling} (${conflict.surfaces.join(", ")})`).join("; ")}. These refs each hold a pending candidate that remains eligible for delivery, not merely a live declared scope; review-rejected candidates stay parked without blocking the wave. Assemble the named candidates in one wave so the delivery merge can check their actual content, or resolve one candidate before assembling a singleton. ${manualCandidateDeliveryGuidance()}`
-      };
-    }
+    const scopeRefusal = waveScopeRefusal(slug, tickets, target?.branch);
+    if (scopeRefusal) return scopeRefusal;
     const firstCandidate = waveCandidates[0];
     if (!firstCandidate) return { ok: false, reason: "wave_baseline_required", message: "Wave assembly requires a candidate baseline." };
     const omittedPendingOverlaps = omittedPendingSubmissionOverlaps(slug, tickets);
@@ -3717,26 +3928,7 @@ ${parts.join("\n\n")}` });
       }
     });
     if (gate.state === "gate_failed") {
-      const wave = { id: waveId, baseline: opened.baseline, participants: participantRefs };
-      if (gate.verification.status === "toolchain_missing") {
-        const provisioningEvidence = verification.provisioning || "The gate did not use an isolated candidate worktree, so worktree provisioning was skipped.";
-        return {
-          ok: false,
-          reason: "assembled_wave_environment_problem",
-          message: `Wave ${waveId} gate could not run because its verification environment is incomplete. ${gate.verification.evidence} ${provisioningEvidence} Provision the missing toolchain and retry; no candidate was rejected.`,
-          wave,
-          assembly: decision.assembly,
-          gate
-        };
-      }
-      return {
-        ok: false,
-        reason: "assembled_wave_gate_failed",
-        message: `Wave ${waveId} gate returned ${gate.verification.status}. Refresh and reverify its candidates before delivery.`,
-        wave,
-        assembly: decision.assembly,
-        gate
-      };
+      return failedWaveGateRefusal({ id: waveId, baseline: opened.baseline, participants: participantRefs }, gate, decision.assembly, verification.provisioning);
     }
     return {
       ok: true,
@@ -3796,6 +3988,6 @@ ${parts.join("\n\n")}` });
     }));
     return { tickets, count: tickets.length, delivery: boardConfig(slug)?.delivery || "merge" };
   }
-  return { DEFAULT_CHECKPOINT_TTL_MIN, MAX_CHECKPOINT_TTL_MIN, checkpointTtlMs, checkpointProjection, oracleProjection, checkpointTicket, submissionReadiness, submissionProjection, pendingSubmission, applyDeliveryAwaitingContentCommit, submissionUsesGit, workingTreeVerification, verifyIntegration, validateIntegrationSubmission, recordDeliveredSubmission, recordAbandonedSubmission, integrateSubmission, integrateSubmissionWave: deliverSubmissionWave, closeSubmissionAsSuperseded, submissionOwnershipFailure, submitTicket, pinnedVerificationRequirement, recordVerificationCapture, recordSubmissionRejection, reconcileSubmissionRejections, reworkSubmission, clearSubmission, assembleSubmissionWave, recordSubmissionWaveDelivery, submissionsPayload };
+  return { DEFAULT_CHECKPOINT_TTL_MIN, MAX_CHECKPOINT_TTL_MIN, checkpointTtlMs, checkpointProjection, oracleProjection, checkpointTicket, submissionReadiness, submissionProjection, pendingSubmission, applyDeliveryAwaitingContentCommit, submissionUsesGit, workingTreeVerification, verifyIntegration, validateIntegrationSubmission, recordDeliveredSubmission, recordAbandonedSubmission, integrateSubmission, integrateSubmissionWave: deliverSubmissionWave, closeSubmissionAsSuperseded, supersedeBuiltOnSources, submissionOwnershipFailure, submitTicket, pinnedVerificationRequirement, recordVerificationCapture, recordSubmissionRejection, reconcileSubmissionRejections, reworkSubmission, clearSubmission, assembleSubmissionWave, recordSubmissionWaveDelivery, submissionsPayload };
 }
 module.exports = { createSubmissions };

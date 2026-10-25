@@ -28,7 +28,7 @@ function branchOverlapProject(): { repository: string; slug: string } {
   git(repository, ['init', '-b', 'main']);
   git(repository, ['config', 'user.name', 'Sidequest Test']);
   git(repository, ['config', 'user.email', 'sidequest-test@example.invalid']);
-  fs.writeFileSync(path.join(repository, 'shared.txt'), 'base\n');
+  fs.writeFileSync(path.join(repository, 'shared.txt'), 'top\n1\n2\n3\n4\n5\n6\n7\n8\n9\nbottom\n');
   git(repository, ['add', '.']);
   git(repository, ['commit', '-m', 'base']);
   git(repository, ['branch', 'story-a']);
@@ -40,11 +40,15 @@ function branchOverlapProject(): { repository: string; slug: string } {
   return { repository, slug };
 }
 
-function submitBranchOverlapCandidate(repository: string, slug: string, branch: string, label: string): string {
+// GH-643: a ticket with no verifier at all fails the gate, so these candidates carry document evidence the gate accepts as supplied.
+const OVERLAP_FIXTURE_EVIDENCE = 'overlap fixture reviewed by hand';
+
+function submitBranchOverlapCandidate(repository: string, slug: string, branch: string, label: string, body = `${label}\n`): string {
   git(repository, ['checkout', branch]);
   const ticket = store.createTicket(slug, {
     title: `overlapping ${label} candidate`, category: 'codebase-exploration',
     description: 'Exercise recorded branch isolation for overlapping candidates.', files: ['shared.txt'],
+    executorVerifyKind: 'document', executorVerify: OVERLAP_FIXTURE_EVIDENCE,
   });
   const prepared = store.prepareDispatch(slug, ticket.ref, { sharedTree: true, integrationMode: 'local', integrationBranch: branch });
   assert.equal(prepared.ticket.dispatch.integrationTarget.branch, branch);
@@ -52,7 +56,7 @@ function submitBranchOverlapCandidate(repository: string, slug: string, branch: 
     token: prepared.token, executor: prepared.ticket.dispatchExecutor,
   }).ok, true);
   git(repository, ['checkout', '-b', `candidate-${label}`, branch]);
-  fs.writeFileSync(path.join(repository, 'shared.txt'), `${label}\n`);
+  fs.writeFileSync(path.join(repository, 'shared.txt'), body);
   git(repository, ['add', 'shared.txt']);
   git(repository, ['commit', '-m', label]);
   const commit = git(repository, ['rev-parse', 'HEAD']);
@@ -60,7 +64,7 @@ function submitBranchOverlapCandidate(repository: string, slug: string, branch: 
   git(repository, ['update-ref', gitRef, commit]);
   const range = commitScope.submissionRange(repository, { commit, gitRef, upstream: branch, integrationBranch: branch });
   assert.equal(range.ok, true, JSON.stringify(range));
-  const submitted = store.submitTicket(slug, ticket.ref, label, { commit, gitRef, range, worktree: repository });
+  const submitted = store.submitTicket(slug, ticket.ref, label, { commit, gitRef, range, worktree: repository, verify: OVERLAP_FIXTURE_EVIDENCE });
   assert.equal(submitted.ok, true, JSON.stringify(submitted));
   return ticket.ref;
 }
@@ -78,11 +82,26 @@ for (const siblingBranch of ['story-a', 'story-b']) {
       assert.deepEqual(assembled.wave.participants, [participantRef]);
     } else {
       assert.equal(assembled.reason, 'candidate_overlap');
-      assert.deepEqual(assembled.conflicts, [{ participant: participantRef, sibling: siblingRef, surfaces: ['shared.txt'] }]);
+      assert.deepEqual(assembled.conflicts.map(({ evidence, ...conflict }: { evidence: string }) => conflict), [{ participant: participantRef, sibling: siblingRef, surfaces: ['shared.txt'] }]);
+      assert.match(assembled.conflicts[0].evidence, /CONFLICT.*shared.txt/);
       assert.match(assembled.message, /Wave assembly paused because submitted candidates overlap/);
     }
   });
 }
+
+test('SQ-3911: disjoint regions of one shared document integrate as singletons', () => {
+  const { repository, slug } = branchOverlapProject();
+  const participantRef = submitBranchOverlapCandidate(repository, slug, 'story-a', 'top-edit', 'changed top\n1\n2\n3\n4\n5\n6\n7\n8\n9\nbottom\n');
+  const siblingRef = submitBranchOverlapCandidate(repository, slug, 'story-a', 'bottom-edit', 'top\n1\n2\n3\n4\n5\n6\n7\n8\n9\nchanged bottom\n');
+  const assembled = store.assembleSubmissionWave(slug, [participantRef], { verification: store.getTicket(slug, participantRef).submission.verificationResult });
+  assert.equal(assembled.ok, true, JSON.stringify(assembled));
+  git(repository, ['checkout', 'story-a']);
+  const delivered = store.integrateSubmission(slug, participantRef, { mode: 'merge', verification: store.getTicket(slug, participantRef).submission.verificationResult });
+  assert.equal(delivered.ok, true, JSON.stringify(delivered));
+  const siblingDelivery = store.integrateSubmission(slug, siblingRef, { mode: 'merge', verification: store.getTicket(slug, siblingRef).submission.verificationResult });
+  assert.equal(siblingDelivery.ok, true, JSON.stringify(siblingDelivery));
+  assert.match(fs.readFileSync(path.join(repository, 'shared.txt'), 'utf8'), /^changed top[\s\S]*changed bottom\n$/);
+});
 
 type CandidateOptions = Readonly<{
   baseline?: Baseline;

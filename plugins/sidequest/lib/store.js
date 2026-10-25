@@ -23,11 +23,11 @@ const commitScope = require("./commit-scope.js");
 const { commitPaths } = commitScope;
 const { branchOwningWorktree, preferredWorktreeIntegrationTarget, agentWorktreePath, agentWorktreeCandidates, agentIdFromWorktreePath, resolvedAgentWorktree, unclaimedDispatchWorktreeReclaim, retainedWorktreeResumeDecision } = require("./worktrees.js");
 const { canonicalPath, checkoutInstanceIdentity, createWorktreeLease, isCanonicalRegisteredWorktree } = require("./kernel/worktree.js");
-const { reviewLockMessage } = require("./kernel/review-binding.js");
+const { reviewLockMessage, MAIN_ATTESTATION_BIND_SOURCE } = require("./kernel/review-binding.js");
 const { migrateIfNeeded } = require("./migrate.js");
 const { catalogStateFingerprint, configuredExternalModelProvider, discoverExternalModels, gatewayCatalogRefreshFailure, providerReadiness } = require("./discovery.js");
 const telemetry = require("./telemetry.js");
-const { negativeControlRecoveryGuidance, routingDisabledMessage, filesystemSnapshotLimitGuidance, filesystemSnapshotChildFailureGuidance, landedWithoutSubmissionGuidance } = require("./refusal-guidance.js");
+const { crossedClaimLeaseMessage, negativeControlRecoveryGuidance, routingDisabledMessage, filesystemSnapshotLimitGuidance, filesystemSnapshotChildFailureGuidance, landedWithoutSubmissionGuidance } = require("./refusal-guidance.js");
 const { canonicalPreparedDispatchExecutor, normalizePreparedDispatch } = require("./prepared-dispatch.js");
 const { assertSidequestInstall, checkSidequestInstall, servingSidequestInstall, assertDispatchTransport, ensurePythonIoEncoding, localAheadOfUpstreamWarning } = require("./dispatch-preflight.js");
 const { prepareAttempt, prepareDirectAttempt, transitionAttempt, attemptDiagnostic, VERIFICATION_KINDS } = require("./kernel/index.js");
@@ -723,6 +723,7 @@ const {
   bindDispatchClaimToken,
   exchangeGuessedClaimIdentity,
   exchangeCrossedClaimCheckout,
+  crossedClaimLease,
   settleDeferredStops,
   tokenAdmission,
   bindDispatchAgent,
@@ -1323,8 +1324,12 @@ function isBehaviorSourcePath(file) {
 function mixedChange(paths) {
   return [paths.some(isTestSidePath), paths.filter((file) => !isTestSidePath(file)).some(isBehaviorSourcePath)].every(Boolean);
 }
-function ownedControlCheck(slug, ticket, delta, ownedPaths) {
+function declaredBehaviorKind(ticket) {
   const kind = ticket.dispatch?.workProvenance?.kind;
+  return kind === "builds-on" ? void 0 : kind;
+}
+function ownedControlCheck(slug, ticket, delta, ownedPaths) {
+  const kind = declaredBehaviorKind(ticket);
   if (["behavior-preserving-refactor", "inherited-read-only", "docs", "type-annotation-only", "fixture-only"].includes(String(kind))) return { ok: true, inheritedTests: [], negativeControl: "not_required(" + kind + ")" };
   const own = negativeControlChanges(slug, ticket, delta, ownedPaths);
   const inheritedTests = own.inheritedTests;
@@ -1630,6 +1635,7 @@ const {
   integrateSubmission,
   integrateSubmissionWave,
   closeSubmissionAsSuperseded,
+  supersedeBuiltOnSources,
   submissionOwnershipFailure,
   submitTicket,
   pinnedVerificationRequirement,
@@ -2222,6 +2228,15 @@ function claimAdmission(slug, idOrRef, opts) {
 function reducedPermissionModeSupported(mode) {
   return mode === "auto" || mode === "bypassPermissions";
 }
+function preparingSessionClaims(state, claimingSessionId) {
+  const sessionId = String(claimingSessionId || "").trim();
+  return Boolean(sessionId) && String(state.sessionId || "").trim() === sessionId;
+}
+function claimRuntimeRefusal(ticket, state, opts) {
+  if (!preparingSessionClaims(state, opts?.sessionId)) return { ok: false, reason: "session_mismatch", ticket };
+  const lease = crossedClaimLease(state, opts?.observedWorktree);
+  return lease ? { ok: false, reason: "worktree_lease_crossed", ticket, ...lease, message: crossedClaimLeaseMessage(ticket.ref, lease) } : null;
+}
 function bindClaimRuntimeIdentity(slug, idOrRef, opts) {
   const agentId = String(opts?.agentId || "").trim();
   const observedPermissionMode = String(opts?.permissionMode || "").trim();
@@ -2247,10 +2262,8 @@ function bindClaimRuntimeIdentity(slug, idOrRef, opts) {
     if (!state || state.terminalAt || !["prepared", "launched", "claimed"].includes(state.outcome)) {
       return { ok: false, reason: "dispatch_unavailable", ticket };
     }
-    const sessionId = String(opts?.sessionId || "").trim();
-    if (!sessionId || String(state.sessionId || "").trim() !== sessionId) {
-      return { ok: false, reason: "session_mismatch", ticket };
-    }
+    const runtimeRefusal = claimRuntimeRefusal(ticket, state, opts);
+    if (runtimeRefusal) return runtimeRefusal;
     const boundAgentId = String(state.agentId || "").trim();
     if (boundAgentId && boundAgentId !== agentId) {
       return { ok: false, reason: "runtime_identity_mismatch", ticket };
@@ -2432,6 +2445,7 @@ function claimTicket(slug, idOrRef, by, opts) {
       state.sessionId = opts.sessionId ? String(opts.sessionId) : state.sessionId || null;
       state.claimedAt = now;
       state.outcome = "claimed";
+      adoptDirectClaimRuntime(state, opts);
     }
     const previousStatus = t.status;
     const preClaimAttempt = activeAttempt;
@@ -2459,6 +2473,11 @@ function claimTicket(slug, idOrRef, by, opts) {
     return { ok: true, ticket: t, ...compatibilityAdvisory ? { advisory: compatibilityAdvisory } : {} };
   });
   return lockedClaimOutcome(slug, found.id, by, result, opts.force);
+}
+function adoptDirectClaimRuntime(state, opts) {
+  if (!opts.direct) return;
+  state.agentId = null;
+  state.bindSource = opts.sessionId ? MAIN_ATTESTATION_BIND_SOURCE : null;
 }
 function heldByAnotherLiveClaimant(ticket, by) {
   const claimant = ticket?.claim?.by;
@@ -3346,7 +3365,7 @@ function deliveredReleasePaths(repo, delivery) {
   return [...commitPaths(repo, delivery.commit), ...delivery.integration?.changedPaths || []];
 }
 function missingReleaseFragmentMessage(ref, fragmentPath, plugins) {
-  return `submit: refused ${ref}; submitted range changes shipped plugin paths (${plugins.map((plugin) => plugin.source).join(", ")}) but does not include ${fragmentPath}. Write the file, then commit it, then submit again. Next time write it BEFORE your first commit so it rides along:
+  return `submit: refused ${ref}; submitted range changes shipped plugin paths (${plugins.map((plugin) => plugin.source).join(", ")}) but does not include ${fragmentPath}. Write the file, then commit it, then submit again. A follow-up dispatched with workProvenance kind builds-on may git mv its source's fragment to this path; delivery records that source superseded. Next time write it BEFORE your first commit so it rides along:
 ---
 ref: ${ref}
 title: <short user-facing title>
@@ -3745,7 +3764,13 @@ function completeTicketAsControlPlane(slug, idOrRef, opts) {
     ),
     ...recorded?.ok ? { recordedDelivery: recorded } : {}
   }));
-  return advisory ? Object.assign(result, { advisory }) : result;
+  const closed = withBuiltOnSupersession(slug, idOrRef, result, purpose, by);
+  return advisory ? Object.assign(closed, { advisory }) : closed;
+}
+function withBuiltOnSupersession(slug, idOrRef, result, purpose, by) {
+  if (!result.ok || purpose === "grooming") return result;
+  const supersededSources = supersedeBuiltOnSources(slug, idOrRef, by);
+  return supersededSources.length ? Object.assign(result, { supersededSources }) : result;
 }
 function closeTicketForGrooming(slug, idOrRef, opts) {
   return completeTicketAsControlPlane(slug, idOrRef, Object.assign({}, opts, { purpose: "grooming" }));
@@ -3949,6 +3974,7 @@ const { boundedExcerpt, changesPayload, commentHistory, pulsePayload } = createP
   submissionProjection
 });
 module.exports = {
+  normalizeIntegrationVerifyTimeoutMs,
   VALID_STATUS,
   VALID_PRIORITY,
   VALID_EFFORTS,
