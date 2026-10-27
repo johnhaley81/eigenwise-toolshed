@@ -110,6 +110,13 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plugin-matrix.outputs.matrix) }}
     steps:
+      # ubuntu-26.04 mounts /tmp as tmpfs, so test helpers that hard-link the Node binary from
+      # /opt/hostedtoolcache into os.tmpdir() fail with EXDEV (Eigenwise #675). Fork carry until
+      # upstream fixes the helpers.
+      - name: Keep temp files on the runner disk
+        if: runner.os != 'Windows'
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Create empty git config
         shell: bash
         run: |
