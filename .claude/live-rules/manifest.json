@@ -2,6 +2,17 @@
   "version": 1,
   "rules": [
     {
+      "path": "rules/agents-first.md",
+      "hash": "8d7ddc35d8681aaea7fead99577375b245b739078c730543244ed0b1bf07a28d",
+      "description": "Agents first on Nexus machines",
+      "globs": [],
+      "dirs": [],
+      "prompt": [],
+      "priority": 0,
+      "enabled": true,
+      "include": []
+    },
+    {
       "path": "rules/docs-stay-current.md",
       "hash": "56dca9da7ae4669adc717ecc011b41484a19b96bc243e41c4453b0ab4c5245be",
       "description": "Prose docs stay current with the code",
@@ -31,7 +42,7 @@
     },
     {
       "path": "rules/release-publication.md",
-      "hash": "b846efef02599c0e24fd5f2acadda6d2b3e448792438e9a3715ab6171c9541f3",
+      "hash": "c97338ce1f232a4c7ad7230e7d8f3a5160069e2e69d498396a5fcffcd9217dd1",
       "description": "Automated release policy",
       "globs": [],
       "dirs": [],
@@ -41,7 +52,9 @@
         "release",
         "bump",
         "hotfix",
-        "marketplace"
+        "marketplace",
+        "promote",
+        "gitflow"
       ],
       "priority": 0,
       "enabled": true,
