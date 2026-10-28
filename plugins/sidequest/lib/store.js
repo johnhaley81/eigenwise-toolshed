@@ -946,18 +946,47 @@ function eachTableTestName(lines, startIndex) {
   }
   return null;
 }
+const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*|#(?!!?\[))/;
+const ATTRIBUTE_LINE = /^\s*#!?\[/;
+const RUST_TEST_ATTRIBUTE = /^\s*#\[\s*(?:(?:::)?[A-Za-z_]\w*\s*::\s*)*test\s*(?:\(.*\))?\s*\]/;
+const RUST_FN = /^(\s*)(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:async|unsafe|const)\s+)*fn\s+([A-Za-z_]\w*)/;
 function testDefinitionName(line, modifiers = false) {
-  const call = modifiers ? /(?<![.\w$])(?:test|it|specify)(?:\.(?:only|skip|todo))?\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/ : /(?<![.\w$])(?:test|it|specify)\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/;
-  return capturedTestName(line.match(call) || line.match(/\bdef\s+(test_[A-Za-z0-9_]+)/));
+  const call = COMMENT_LINE.test(line) ? null : modifiers ? /(?<![.\w$])(?:test|it|specify)(?:\.(?:only|skip|todo))?\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/ : /(?<![.\w$])(?:test|it|specify)\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/;
+  return capturedTestName(call && line.match(call) || line.match(/\bdef\s+(test_[A-Za-z0-9_]+)/));
+}
+function rustTestDefinition(lines, index) {
+  const fn = lines[index].match(RUST_FN);
+  if (!fn) return null;
+  let attributeStart;
+  let isTest = false;
+  for (let above = index - 1; above >= 0; above -= 1) {
+    const text = lines[above];
+    if (!text.trim() || COMMENT_LINE.test(text)) continue;
+    if (!ATTRIBUTE_LINE.test(text)) break;
+    attributeStart = above + 1;
+    isTest ||= RUST_TEST_ATTRIBUTE.test(text);
+  }
+  if (!isTest) return null;
+  const closing = `${fn[1]}}`;
+  let end = /\{.*\}\s*$/.test(lines[index]) ? index + 1 : void 0;
+  for (let below = index + 1; end === void 0 && below < lines.length; below += 1) {
+    if (lines[below].trimEnd() === closing) end = below + 1;
+  }
+  return { line: index + 1, name: fn[2], end, attributeStart };
 }
 function testDefinitionNameAt(lines, index, modifiers = false) {
   const line = lines[index];
-  return testDefinitionName(line, modifiers) ?? (/(?<![.\w$])(?:test|it|specify)\.each\b/.test(line) ? eachTableTestName(lines, index) : null);
+  return testDefinitionName(line, modifiers) ?? (!COMMENT_LINE.test(line) && /(?<![.\w$])(?:test|it|specify)\.each\b/.test(line) ? eachTableTestName(lines, index) : null);
 }
 function testDefinitions(source, modifiers = false) {
   const lines = source.split(/\r?\n/);
   const definitions = [];
   for (let index = 0; index < lines.length; index += 1) {
+    const rust = rustTestDefinition(lines, index);
+    if (rust) {
+      definitions.push(rust);
+      continue;
+    }
     const name = testDefinitionNameAt(lines, index, modifiers);
     if (name) definitions.push({ line: index + 1, name });
   }
@@ -1010,7 +1039,12 @@ function definitionAheadInRun(changed, index, definedAt) {
 function diffTestNames(source, diff) {
   const definitions = testDefinitions(source);
   const definedAt = new Map(definitions.map((entry) => [entry.line, entry.name]));
-  const nearest = (line) => definitions.filter((entry) => entry.line <= line).at(-1)?.name;
+  const nearest = (line) => {
+    const decorated = definitions.find((entry) => entry.attributeStart !== void 0 && entry.attributeStart <= line && line < entry.line);
+    if (decorated) return decorated.name;
+    const above = definitions.filter((entry) => entry.line <= line).at(-1);
+    return above && !(above.end !== void 0 && above.end < line) ? above.name : void 0;
+  };
   return diffHunks(diff).flatMap((hunk) => {
     const changed = changedLines(hunk);
     return changed.flatMap((entry, index) => [

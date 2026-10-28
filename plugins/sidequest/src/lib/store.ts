@@ -915,23 +915,69 @@ function eachTableTestName(lines: string[], startIndex: number) {
   return null;
 }
 
+// A Rust attribute (`#[`, `#![`) opens with `#` but is code, so only a `#` not followed by `[` or `![` is a comment.
+const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*|#(?!!?\[))/;
+const ATTRIBUTE_LINE = /^\s*#!?\[/;
+const RUST_TEST_ATTRIBUTE = /^\s*#\[\s*(?:(?:::)?[A-Za-z_]\w*\s*::\s*)*test\s*(?:\(.*\))?\s*\]/;
+const RUST_FN = /^(\s*)(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:async|unsafe|const)\s+)*fn\s+([A-Za-z_]\w*)/;
+
 function testDefinitionName(line: string, modifiers = false) {
-  const call = modifiers
-    ? /(?<![.\w$])(?:test|it|specify)(?:\.(?:only|skip|todo))?\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/
-    : /(?<![.\w$])(?:test|it|specify)\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/;
-  return capturedTestName(line.match(call) || line.match(/\bdef\s+(test_[A-Za-z0-9_]+)/));
+  // A comment can quote a call without defining a test (GH-681).
+  const call = COMMENT_LINE.test(line)
+    ? null
+    : modifiers
+      ? /(?<![.\w$])(?:test|it|specify)(?:\.(?:only|skip|todo))?\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/
+      : /(?<![.\w$])(?:test|it|specify)\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/;
+  return capturedTestName((call && line.match(call)) || line.match(/\bdef\s+(test_[A-Za-z0-9_]+)/));
+}
+
+type TestDefinition = {
+  line: number;
+  name: string;
+  // Rust only: the last line of the body, and the first line of the attribute block above the `fn`.
+  end?: number;
+  attributeStart?: number;
+};
+
+// A `fn` is a Rust test when the attributes right above it, skipping blank and comment lines, include a
+// test attribute. The body ends at the first `}` back at the `fn`'s indentation (rustfmt layout), or on
+// the `fn` line itself for `fn x() {}`; an unfound end leaves the test owning everything below it.
+function rustTestDefinition(lines: string[], index: number): TestDefinition | null {
+  const fn = lines[index]!.match(RUST_FN);
+  if (!fn) return null;
+  let attributeStart: number | undefined;
+  let isTest = false;
+  for (let above = index - 1; above >= 0; above -= 1) {
+    const text = lines[above]!;
+    if (!text.trim() || COMMENT_LINE.test(text)) continue;
+    if (!ATTRIBUTE_LINE.test(text)) break;
+    attributeStart = above + 1;
+    isTest ||= RUST_TEST_ATTRIBUTE.test(text);
+  }
+  if (!isTest) return null;
+  const closing = `${fn[1]}}`;
+  let end = /\{.*\}\s*$/.test(lines[index]!) ? index + 1 : undefined;
+  for (let below = index + 1; end === undefined && below < lines.length; below += 1) {
+    if (lines[below]!.trimEnd() === closing) end = below + 1;
+  }
+  return { line: index + 1, name: fn[2]!, end, attributeStart };
 }
 
 // An `.each` table carries its name after the table, so the opening line alone names nothing.
 function testDefinitionNameAt(lines: string[], index: number, modifiers = false) {
   const line = lines[index]!;
-  return testDefinitionName(line, modifiers) ?? (/(?<![.\w$])(?:test|it|specify)\.each\b/.test(line) ? eachTableTestName(lines, index) : null);
+  return testDefinitionName(line, modifiers) ?? (!COMMENT_LINE.test(line) && /(?<![.\w$])(?:test|it|specify)\.each\b/.test(line) ? eachTableTestName(lines, index) : null);
 }
 
 function testDefinitions(source: string, modifiers = false) {
   const lines = source.split(/\r?\n/);
-  const definitions: Array<{ line: number; name: string }> = [];
+  const definitions: TestDefinition[] = [];
   for (let index = 0; index < lines.length; index += 1) {
+    const rust = rustTestDefinition(lines, index);
+    if (rust) {
+      definitions.push(rust);
+      continue;
+    }
     const name = testDefinitionNameAt(lines, index, modifiers);
     if (name) definitions.push({ line: index + 1, name });
   }
@@ -1007,7 +1053,13 @@ function definitionAheadInRun(changed: ChangedLine[], index: number, definedAt: 
 function diffTestNames(source: string, diff: string) {
   const definitions = testDefinitions(source);
   const definedAt = new Map(definitions.map((entry) => [entry.line, entry.name]));
-  const nearest = (line: number) => definitions.filter((entry) => entry.line <= line).at(-1)?.name;
+  // A Rust test owns its attribute block and its own body, so a helper after it is not that test's change.
+  const nearest = (line: number) => {
+    const decorated = definitions.find((entry) => entry.attributeStart !== undefined && entry.attributeStart <= line && line < entry.line);
+    if (decorated) return decorated.name;
+    const above = definitions.filter((entry) => entry.line <= line).at(-1);
+    return above && !(above.end !== undefined && above.end < line) ? above.name : undefined;
+  };
   return diffHunks(diff).flatMap((hunk) => {
     const changed = changedLines(hunk);
     return changed.flatMap((entry, index) => [
