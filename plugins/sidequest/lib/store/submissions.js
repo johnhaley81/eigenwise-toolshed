@@ -864,7 +864,11 @@ ${JSON.stringify(quality.unverified)}`,
     const participants = opts?.qualityTickets || [ticket];
     const changedPaths = participants.flatMap((participant) => participant.submission.changedPaths || []);
     const runWithImportingTests = (environment) => (0, import_integration_tests.runImportingIntegrationTests)(project, changedPaths, verify(environment), timeoutMilliseconds, environment, boardConfig(slug).integrationTestFileThreshold);
-    const runWithQuality = (environment) => verifyCandidateQuality(slug, participants, project, timeoutMilliseconds, runWithImportingTests, environment);
+    const runWithQuality = (environment) => {
+      const captureEnvironment = (0, import_integration_tests.integrationCaptureEnvironment)(projectDir(slug), environment);
+      const result = verifyCandidateQuality(slug, participants, project, timeoutMilliseconds, runWithImportingTests, captureEnvironment);
+      return { ...(0, import_integration_tests.phaseBudgetResult)(result), liveVerifyCaptureCount: Number(captureEnvironment.SIDEQUEST_LIVE_VERIFY_CAPTURE_COUNT) };
+    };
     return verifyWithFullSuiteCapture(requirement.command, project, runWithQuality);
   }
   function verificationFailureComment(verify) {
@@ -1102,6 +1106,9 @@ ${verify.outputTail}` : null
     if (newlyDelivered) afterCommit(() => emitDeliveryExternalRefs(slug, ticket));
     queueEventNotification(slug, ticket, "status", "integration");
   }
+  function deliveredBranch(integration) {
+    return integration.deliveryBranch || integration.targetBranch;
+  }
   function emitDeliveryExternalRefs(slug, ticket) {
     const integration = ticket.submission.integration;
     const revision = integration.sourceRevision;
@@ -1111,7 +1118,7 @@ ${verify.outputTail}` : null
       kind: "delivered",
       mode: boardConfig(slug).githubSync,
       cwd: readMeta(slug).path,
-      branch: integration.targetBranch || boardConfig(slug).integrationBranch,
+      branch: deliveredBranch(integration) || boardConfig(slug).integrationBranch,
       sha,
       onFailure: (body) => {
         ticket.comments.push(createComment({ by: "github-sync", kind: "comment", source: "integration", body }));
@@ -1758,7 +1765,7 @@ ${verify.outputTail}` : null
   function recordedDeliveryNotAtTipMessage(targetBranch, currentBranch, givenWorktree) {
     const checkedOut = currentBranch || "detached HEAD";
     const where = givenWorktree ? `the worktree given (${givenWorktree})` : "this checkout";
-    return `${targetBranch} must be checked out before recording an external delivery; ${where} is on ${checkedOut}, not at the ${targetBranch} tip. Check out the observed ${targetBranch} tip (the branch itself, or a detached checkout of its current tip, which may be later than deliveryCommit), or give such a worktree via worktree:"<path>" (CLI: --worktree <path>).`;
+    return `${targetBranch} must be checked out before recording an external delivery; ${where} is on ${checkedOut}, not at the ${targetBranch} tip. Check out the observed ${targetBranch} tip (the branch itself, or a detached checkout of its current tip, which may be later than deliveryCommit), or give such a worktree via worktree:"<path>" (CLI: --worktree <path>). When the delivery landed on another branch instead, such as one waiting on an open pull request, record it there with integrate deliveryBranch:"<branch>" and pullRequests:["<url>"].`;
   }
   function refTipEquals(repo, ref, commit) {
     try {
@@ -1766,6 +1773,61 @@ ${verify.outputTail}` : null
     } catch (_) {
       return false;
     }
+  }
+  function deliveryRequestRefusal(ticket, reason, detail) {
+    return { ok: false, reason, ticket, message: `${ticket.ref} delivery refused: ${detail}` };
+  }
+  function pullRequestReferences(values) {
+    const urls = Array.isArray(values) ? values.map((value) => String(value).trim()) : [];
+    return urls.every((url) => /^https?:\/\/\S+$/i.test(url)) ? urls.map((url) => ({ kind: "pr", url })) : null;
+  }
+  function namedOffTargetDelivery(ticket, requestedBranch, targetBranch, refs) {
+    let branch;
+    try {
+      branch = normalizeIntegrationBranch(requestedBranch);
+    } catch (_) {
+      return deliveryRequestRefusal(ticket, "invalid_delivery_branch", `deliveryBranch ${JSON.stringify(requestedBranch)} is not a valid Git branch name.`);
+    }
+    if (branch === targetBranch) {
+      return deliveryRequestRefusal(ticket, "delivery_branch_is_target", `deliveryBranch ${branch} is the recorded integration branch; omit deliveryBranch to record a delivery on it.`);
+    }
+    const request = { ok: true, branch, offTarget: true, refs };
+    return request;
+  }
+  function deliveryBranchRequest(ticket, opts, targetBranch) {
+    const refs = pullRequestReferences(opts.pullRequests);
+    if (!refs) return deliveryRequestRefusal(ticket, "invalid_pull_request", "pullRequests takes the http(s) URL of each pull request.");
+    const requestedBranch = String(opts.deliveryBranch || "").trim();
+    if (!requestedBranch) {
+      const targetRequest = { ok: true, branch: targetBranch, offTarget: false, refs };
+      return refs.length ? deliveryRequestRefusal(ticket, "delivery_branch_required", "pullRequests records an off-target delivery, so it needs deliveryBranch.") : targetRequest;
+    }
+    return namedOffTargetDelivery(ticket, requestedBranch, targetBranch, refs);
+  }
+  function targetDeliveryRevisionSource(checkout, target) {
+    if (checkout.currentBranch === target.branch) return `git:${target.branch}`;
+    const matchedRef = commitScope.integrationTargetRefs(target).find((ref) => refTipEquals(checkout.repo, ref, checkout.resultingHead));
+    return matchedRef ? `git:${commitScope.integrationRefLabel(matchedRef)}` : null;
+  }
+  function offTargetNotAtTipDetail(checkout, branch) {
+    const where = checkout.givenWorktree ? `the worktree given (${checkout.givenWorktree})` : "this checkout";
+    return `${where} is on ${checkout.currentBranch || "detached HEAD"}, not at the ${branch} tip. Check ${branch} out in a worktree of this project (that checkout is selected automatically), or give a worktree at its tip via worktree:"<path>".`;
+  }
+  function offTargetDeliveryRevisionSource(checkout, ticket, branch, deliveryCommit) {
+    const atTip = checkout.currentBranch === branch || refTipEquals(checkout.repo, `refs/heads/${branch}`, checkout.resultingHead);
+    if (!atTip) return deliveryRequestRefusal(ticket, "branch_not_checked_out", offTargetNotAtTipDetail(checkout, branch));
+    if (!commitIsAncestor(checkout.repo, deliveryCommit, checkout.resultingHead)) {
+      return deliveryRequestRefusal(ticket, "delivery_not_reachable", `delivery commit ${deliveryCommit} is not reachable from ${branch}.`);
+    }
+    return { ok: true, source: `git:${branch}` };
+  }
+  function observedDeliveryRevisionSource(checkout, ticket, target, delivery, deliveryCommit) {
+    if (delivery.offTarget) return offTargetDeliveryRevisionSource(checkout, ticket, delivery.branch, deliveryCommit);
+    const source = targetDeliveryRevisionSource(checkout, target);
+    return source ? { ok: true, source } : { ok: false, reason: "branch_not_checked_out", ticket, message: recordedDeliveryNotAtTipMessage(target.branch, checkout.currentBranch, checkout.givenWorktree) };
+  }
+  function offTargetDeliveryRecord(delivery) {
+    return delivery.offTarget ? { deliveryBranch: delivery.branch, deliveryRefs: delivery.refs } : {};
   }
   function manualDeliveryIntegrationBranch(slug, idOrRef, target) {
     if (!getTicket(slug, idOrRef)?.dispatch?.integrationTarget) return void 0;
@@ -1811,8 +1873,10 @@ ${verify.outputTail}` : null
     const registeredRepo = String(readMeta(slug)?.path || "").trim();
     const target = opts.target;
     if (!registeredRepo || !target?.branch) return { ok: false, reason: "integration_target_unavailable", ticket };
+    const delivery = deliveryBranchRequest(ticket, opts, target.branch);
+    if (!delivery.ok) return delivery;
     const requestedWorktree = String(opts.worktree || "").trim();
-    let repo = worktrees.branchOwningWorktree(registeredRepo, target.branch);
+    let repo = worktrees.branchOwningWorktree(registeredRepo, delivery.branch);
     if (requestedWorktree) {
       const resolvedWorktree = resolveDeliveryWorktree(registeredRepo, requestedWorktree);
       if (!resolvedWorktree.ok) {
@@ -1824,21 +1888,11 @@ ${verify.outputTail}` : null
       const currentBranch = integrationGit(repo, ["branch", "--show-current"]);
       const deliveryCommit = integrationGit(repo, ["rev-parse", "--verify", `${requestedCommit}^{commit}`]).toLowerCase();
       const resultingHead = integrationGit(repo, ["rev-parse", "HEAD"]).toLowerCase();
-      let observedIntegrationRevisionSource = `git:${target.branch}`;
-      if (currentBranch !== target.branch) {
-        const matchedRef = commitScope.integrationTargetRefs(target).find((ref) => refTipEquals(repo, ref, resultingHead));
-        if (!matchedRef) {
-          return {
-            ok: false,
-            reason: "branch_not_checked_out",
-            ticket,
-            message: recordedDeliveryNotAtTipMessage(target.branch, currentBranch, requestedWorktree ? repo : "")
-          };
-        }
-        observedIntegrationRevisionSource = `git:${commitScope.integrationRefLabel(matchedRef)}`;
-      }
+      const checkout = { repo, currentBranch, resultingHead, givenWorktree: requestedWorktree ? repo : "" };
+      const observedSource = observedDeliveryRevisionSource(checkout, ticket, target, delivery, deliveryCommit);
+      if (!observedSource.ok) return observedSource;
       const observedIntegrationRevision = {
-        source: observedIntegrationRevisionSource,
+        source: observedSource.source,
         value: resultingHead,
         observedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
@@ -1951,7 +2005,8 @@ ${verify.outputTail}` : null
         sourceRevision: observedIntegrationRevision,
         ...interaction.interaction ? { sourceCommit: deliveryCommit, interaction: interaction.interaction } : {},
         ...workingTreeDelivery ? { method: deliveryMethod } : {},
-        ...revisionProof ? { revision: revisionProof.revision } : {}
+        ...revisionProof ? { revision: revisionProof.revision } : {},
+        ...offTargetDeliveryRecord(delivery)
       };
       const recorded = updateSubmissionIntegration(slug, ticket.id, {
         mode: interaction.interaction ? "recorded-reviewed-interaction" : workingTreeDelivery ? "recorded-working-tree" : completingApplyDelivery ? "recorded-apply-content-commit" : replacementRequirement ? "recorded-verify-superseded" : "recorded",
@@ -1967,6 +2022,7 @@ ${verify.outputTail}` : null
         deliveryIdentity,
         targetBranch: target.branch,
         targetUpstream: target.upstream,
+        ...offTargetDeliveryRecord(delivery),
         changedPaths: changedIntegrationPaths(repo, ticket.submission),
         deliveredFiles,
         // The applied bytes now live in a commit, so the dirty-file record that marked
@@ -3559,7 +3615,10 @@ ${parts.join("\n\n")}` });
     return `Wave assembly requires one project-defined verification gate. Its participants ${difference}, so this assembly cannot choose or rewrite one. Non-executable kinds (${NON_EXECUTABLE_WAVE_VERIFICATION_KINDS.join(", ")}) only need to agree on kind; executable requirements run each pinned command on the composed tree. ${manualCandidateDeliveryGuidance()}`;
   }
   function waveVerificationRequirement(tickets) {
-    const requirements = tickets.map(deliveryVerificationRequirement);
+    const requirements = tickets.map((ticket) => {
+      const requirement = deliveryVerificationRequirement(ticket);
+      return { ...requirement, verifyCwd: verifyCwdForRequirement(requirement, ticket.executorVerifyCwd) };
+    });
     const first = requirements[0];
     if (!first) return { ok: false, reason: "wave_verification_required", message: "Wave assembly requires a pinned project verification requirement." };
     const sameKind = requirements.every((requirement) => requirement.kind === first.kind);
@@ -3571,7 +3630,7 @@ ${parts.join("\n\n")}` });
     return { ok: true, requirement: first, requirements: distinctWaveVerifiers(requirements) };
   }
   function sameWaveVerifier(left, right) {
-    return waveVerifierIdentity(left) === waveVerifierIdentity(right) && left.environment === right.environment;
+    return waveVerifierIdentity(left) === waveVerifierIdentity(right) && left.environment === right.environment && left.verifyCwd === right.verifyCwd;
   }
   function distinctWaveVerifiers(requirements) {
     return requirements.filter((requirement, index) => requirements.findIndex((other) => sameWaveVerifier(other, requirement)) === index);
@@ -3717,15 +3776,29 @@ ${parts.join("\n\n")}` });
     }
     return { ok: true, provisioning: provisioning.evidence, verification: verifyWaveCommands(slug, waveId, requirements, checkout) };
   }
+  function verifyWaveCommand(slug, waveId, requirement, checkoutRoot, index) {
+    const cwd = path.resolve(checkoutRoot, requirement.verifyCwd || ".");
+    if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
+      return {
+        kind: requirement.kind,
+        status: "could_not_run",
+        command: requirement.command,
+        cwd,
+        evidence: `verify_cwd_missing: ${cwd}`,
+        failureIdentities: [`verify_cwd_missing: ${cwd}`]
+      };
+    }
+    return { ...runProcessVerification(requirement, {
+      cwd,
+      timeoutMilliseconds: normalizeIntegrationVerifyTimeoutMs(boardConfig(slug)?.integrationVerifyTimeoutMs),
+      logPath: integrationVerifyLogPath(slug, { ref: waveId + "-" + index }),
+      outputTailBytes: INTEGRATION_VERIFY_OUTPUT_TAIL_BYTES
+    }), cwd };
+  }
   function verifyWaveCommands(slug, waveId, requirements, checkout) {
     const results = requirements.map((requirement, index) => {
       (0, import_integration_tests.reportIntegrationProgress)("wave gate", requirement.command);
-      const verification = runProcessVerification(requirement, {
-        cwd: checkout.cwd,
-        timeoutMilliseconds: normalizeIntegrationVerifyTimeoutMs(boardConfig(slug)?.integrationVerifyTimeoutMs),
-        logPath: integrationVerifyLogPath(slug, { ref: waveId + "-" + index }),
-        outputTailBytes: INTEGRATION_VERIFY_OUTPUT_TAIL_BYTES
-      });
+      const verification = verifyWaveCommand(slug, waveId, requirement, checkout.cwd, index);
       return checkout.tree ? { ...verification, verifiedTree: checkout.tree } : verification;
     });
     const result = results.find((verification) => !verificationAccepted(verification)) || results[0];
